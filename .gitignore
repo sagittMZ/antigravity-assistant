@@ -1,0 +1,10 @@
+venv/
+logs/
+__pycache__/
+.env
+session.json
+implementation_plan_latest.md
+task_latest.md
+walkthrough_latest.md
+*.log
+artifacts/
