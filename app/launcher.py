@@ -1,7 +1,12 @@
+"""
+launcher.py — Unified launcher for all Antigravity Assistant services.
+"""
+
 import os
 import socket
 import subprocess
 import sys
+import signal
 import time
 from pathlib import Path
 import urllib.request
@@ -9,18 +14,16 @@ import urllib.error
 
 from dotenv import load_dotenv
 
-# ─────────────────────────────────────────────────────────────
-# Paths and env
-# ─────────────────────────────────────────────────────────────
-
-BASE_DIR = Path(__file__).parent.parent  # project root: antigravity-assistant
+BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 HOME = Path.home()
 PROJECT_DIR = BASE_DIR
 VENV_PYTHON = PROJECT_DIR / "venv" / "bin" / "python"
 
-# Paths can be overridden from .env
+if not VENV_PYTHON.exists():
+    VENV_PYTHON = Path(sys.executable)
+
 ANTIGRAVITY_PROJECT_DIR = Path(
     os.getenv("ANTIGRAVITY_PROJECT_DIR", str(HOME / "antigravity" / "projects" / "crewtask-v2"))
 )
@@ -32,46 +35,88 @@ PHONE_WORKER_HOST = "127.0.0.1"
 PHONE_WORKER_PORT = 8788
 PHONE_WORKER_URL = f"http://{PHONE_WORKER_HOST}:{PHONE_WORKER_PORT}"
 
+FILE_MONITOR_HOST = "127.0.0.1"
+FILE_MONITOR_PORT = 8787
+
 LAUNCH_ANTIGRAVITY = os.getenv("LAUNCH_ANTIGRAVITY", "true").lower() == "true"
 AUTO_INIT_SESSION = os.getenv("AUTO_INIT_SESSION", "true").lower() == "true"
+ANTIGRAVITY_DEBUG_PORT = int(os.getenv("ANTIGRAVITY_DEBUG_PORT", "9000"))
 
 LOG_DIR = PROJECT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
-
-def run_process(cmd, cwd=None, name=None):
-    """Start subprocess and write its stdout/stderr into a log file."""
-    proc_name = (name or cmd[0]).replace(" ", "_")
-    log_path = LOG_DIR / f"{proc_name}.log"
-    print(f"→ Starting {name or cmd[0]}: {' '.join(str(c) for c in cmd)} (cwd={cwd}), log: {log_path}")
-    log_file = open(log_path, "w", encoding="utf-8")
-    return subprocess.Popen(
-        [str(c) for c in cmd],
-        cwd=cwd,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+HEALTH_CHECK_INTERVAL = 30
+MAX_RESTARTS = 5
 
 
-def http_post(url: str, timeout: float = 10.0) -> bool:
-    """Best-effort HTTP POST helper. Returns False on any error."""
-    try:
-        req = urllib.request.Request(url, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            _ = resp.read()
+class Service:
+    def __init__(self, name, cmd, cwd=None, check_port=None, depends_on_port=None):
+        self.name = name
+        self.cmd = cmd
+        self.cwd = cwd
+        self.check_port = check_port
+        self.depends_on_port = depends_on_port
+        self.proc = None
+        self.log_file = None
+        self.restart_count = 0
+        self.started = False
+
+    def start(self):
+        if self.depends_on_port and not is_port_in_use("127.0.0.1", self.depends_on_port):
+            print(f"⚠️  {self.name}: waiting port {self.depends_on_port}...")
+            for _ in range(30):
+                time.sleep(1)
+                if is_port_in_use("127.0.0.1", self.depends_on_port):
+                    break
+            else:
+                print(f"⚠️  {self.name}: port {self.depends_on_port} is not ready during 30 sec")
+
+        if self.check_port and is_port_in_use("127.0.0.1", self.check_port):
+            print(f"ℹ️  {self.name}: port {self.check_port} busy - may be already working.")
+            self.started = True
+            return
+
+        log_path = LOG_DIR / f"{self.name}.log"
+        print(f"→ Запуск {self.name}: {' '.join(str(c) for c in self.cmd)}")
+        self.log_file = open(log_path, "w", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            [str(c) for c in self.cmd],
+            cwd=self.cwd,
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self.started = True
+
+    def is_alive(self):
+        if self.proc is None:
+            return self.started
+        return self.proc.poll() is None
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            print(f"→ Stopping {self.name}...")
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.log_file:
+            self.log_file.close()
+
+    def restart(self):
+        if self.restart_count >= MAX_RESTARTS:
+            print(f"❌ {self.name}: restart limit exceeded ({MAX_RESTARTS})")
+            return False
+        self.restart_count += 1
+        print(f"🔄 Restart {self.name} (attempt {self.restart_count}/{MAX_RESTARTS})...")
+        self.stop()
+        time.sleep(2)
+        self.start()
         return True
-    except urllib.error.URLError as e:
-        print(f"⚠️ HTTP POST {url} failed: {e}")
-        return False
 
 
-def is_port_in_use(host: str, port: int) -> bool:
-    """Check if TCP port is already in use."""
+def is_port_in_use(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         try:
@@ -81,132 +126,134 @@ def is_port_in_use(host: str, port: int) -> bool:
             return False
 
 
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
+def http_get_ok(url, timeout=5.0):
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def find_and_kill_extra_antigravity():
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "antigravity.*--remote-debugging-port"],
+            capture_output=True, text=True
+        )
+        pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+        if len(pids) > 1:
+            print(f"⚠️   {len(pids)} antigravity processes found. Keeping the first one, killing the rest.")
+            for pid in pids[1:]:
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+    except Exception:
+        pass
+
 
 def main():
-    if not VENV_PYTHON.exists():
-        print(f"Python from venv not found: {VENV_PYTHON}")
-        sys.exit(1)
+    print("🚀 Launcher: starting Antigravity Assistant")
+    print(f"   Project DIRECTORY: {PROJECT_DIR}")
+    print(f"   Antigravity: {ANTIGRAVITY_PROJECT_DIR}")
+    print(f"   Phone Connect: {PHONE_CONNECT_DIR}")
+    print()
 
-    print("🚀 Launcher: starting Antigravity + Phone Connect + assistant stack")
-    print(f"Assistant project dir: {PROJECT_DIR}")
-    print(f"AUTO_INIT_SESSION={AUTO_INIT_SESSION}, LAUNCH_ANTIGRAVITY={LAUNCH_ANTIGRAVITY}")
+    services = []
 
-    processes = []
-
-    # 1. Antigravity IDE (optional)
-    ag_proc = None
+    # 1. Antigravity IDE
     if LAUNCH_ANTIGRAVITY:
         if ANTIGRAVITY_PROJECT_DIR.exists():
-            if is_port_in_use("127.0.0.1", 9000):
-                print("ℹ️ Port 9000 is already in use. Assuming Antigravity is already running.")
-            else:
-                print("→ Starting Antigravity IDE with --remote-debugging-port=9000 ...")
-                ag_cmd = ["antigravity", ".", "--remote-debugging-port=9000"]
-                ag_proc = run_process(ag_cmd, cwd=ANTIGRAVITY_PROJECT_DIR, name="Antigravity")
-                processes.append(("Antigravity", ag_proc))
-                time.sleep(5)
+            find_and_kill_extra_antigravity()
+            services.append(Service(
+                name="Antigravity",
+                cmd=["antigravity", ".", f"--remote-debugging-port={ANTIGRAVITY_DEBUG_PORT}"],
+                cwd=ANTIGRAVITY_PROJECT_DIR,
+                check_port=ANTIGRAVITY_DEBUG_PORT,
+            ))
         else:
-            print(f"⚠️ Antigravity project folder not found: {ANTIGRAVITY_PROJECT_DIR}")
+            print(f"⚠️  The directory named Antigravity was not found: {ANTIGRAVITY_PROJECT_DIR}")
     else:
-        print(
-            "ℹ️ LAUNCH_ANTIGRAVITY=false, skipping Antigravity startup. "
-            "Make sure IDE is running with --remote-debugging-port=9000."
-        )
+        print("ℹ️  LAUNCH_ANTIGRAVITY=false - skipping.")
 
     # 2. Phone Connect
-    pc_proc = None
     if PHONE_CONNECT_DIR.exists():
-        print("→ Starting Phone Connect (python3 launcher.py) ...")
-        pc_cmd = ["python3", "launcher.py"]
-        pc_proc = run_process(pc_cmd, cwd=PHONE_CONNECT_DIR, name="Phone_Connect")
-        processes.append(("Phone_Connect", pc_proc))
-        time.sleep(8)
+        services.append(Service(
+            name="Phone_Connect",
+            cmd=["python3", "launcher.py"],
+            cwd=PHONE_CONNECT_DIR,
+            check_port=3000,
+            depends_on_port=ANTIGRAVITY_DEBUG_PORT,
+        ))
     else:
-        print(f"⚠️ Phone Connect folder not found: {PHONE_CONNECT_DIR}")
+        print(f"⚠️  The directory named  Phone Connect was not found: {PHONE_CONNECT_DIR}")
 
-    # 3. phone_worker (Playwright + FastAPI)
-    if is_port_in_use(PHONE_WORKER_HOST, PHONE_WORKER_PORT):
-        print(f"ℹ️ Port {PHONE_WORKER_PORT} already in use. Assuming phone_worker is already running.")
-        pw_proc = None
-    else:
-        print("→ Starting phone_worker (Playwright + FastAPI) ...")
-        pw_cmd = [
-            VENV_PYTHON,
-            "-m",
-            "uvicorn",
-            "app.phone_worker:app",
-            "--host",
-            PHONE_WORKER_HOST,
-            "--port",
-            str(PHONE_WORKER_PORT),
-        ]
-        pw_proc = run_process(pw_cmd, cwd=PROJECT_DIR, name="phone_worker")
-        processes.append(("phone_worker", pw_proc))
+    # 3. Phone Worker
+    services.append(Service(
+        name="phone_worker",
+        cmd=[str(VENV_PYTHON), "-m", "uvicorn", "app.phone_worker:app",
+             "--host", PHONE_WORKER_HOST, "--port", str(PHONE_WORKER_PORT)],
+        cwd=PROJECT_DIR,
+        check_port=PHONE_WORKER_PORT,
+        depends_on_port=3000,
+    ))
+
+    # 4. File Monitor
+    services.append(Service(
+        name="file_monitor",
+        cmd=[str(VENV_PYTHON), "-m", "uvicorn", "app.file_monitor:app",
+             "--host", FILE_MONITOR_HOST, "--port", str(FILE_MONITOR_PORT)],
+        cwd=PROJECT_DIR,
+        check_port=FILE_MONITOR_PORT,
+    ))
+
+    # 5. Telegram Bot
+    services.append(Service(
+        name="tg_bot",
+        cmd=[str(VENV_PYTHON), "-m", "app.tg_bot"],
+        cwd=PROJECT_DIR,
+    ))
+
+    for svc in services:
+        svc.start()
         time.sleep(3)
 
-    # 4. Initialize first session via Playwright (optional, never fatal)
+    print("\n✅ All services are running:")
+    for svc in services:
+        status = "✅" if svc.is_alive() else "❌"
+        port_info = f" (port {svc.check_port})" if svc.check_port else ""
+        print(f"   {svc.name}: {status}{port_info}")
+
     if AUTO_INIT_SESSION:
-        print("→ Sending initial message via phone_worker /init ...")
-        init_ok = http_post(f"{PHONE_WORKER_URL}/init", timeout=5.0)
-        if init_ok:
-            print("✅ Initial message sent successfully.")
-        else:
-            print(
-                "⚠️ Failed to send initial message. "
-                "Check PHONE_CONNECT_URL and Phone Connect state. "
-                "Continuing without init."
-            )
-    else:
-        print("ℹ️ AUTO_INIT_SESSION=false, skipping initial /init call.")
+        time.sleep(5)
+        if http_get_ok(f"{PHONE_WORKER_URL}/health"):
+            try:
+                req = urllib.request.Request(f"{PHONE_WORKER_URL}/init", method="POST",
+                    headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=10)
+                print("✅ Session initialized.")
+            except Exception as e:
+                print(f"⚠️  Init failed: {e}")
 
-    # 5. file_monitor (uvicorn)
-    print("→ Starting file_monitor (uvicorn) ...")
-    fm_cmd = [
-        VENV_PYTHON,
-        "-m",
-        "uvicorn",
-        "app.file_monitor:app",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8787",
-    ]
-    fm_proc = run_process(fm_cmd, cwd=PROJECT_DIR, name="file_monitor")
-    processes.append(("file_monitor", fm_proc))
-    time.sleep(1)
-
-    # 6. Telegram bot
-    print("→ Starting Telegram bot (app.tg_bot) ...")
-    bot_cmd = [VENV_PYTHON, "-m", "app.tg_bot"]
-    bot_proc = run_process(bot_cmd, cwd=PROJECT_DIR, name="tg_bot")
-    processes.append(("tg_bot", bot_proc))
-    time.sleep(1)
-
-    print("\n✅ All available services started (if paths and URLs are correct):")
-    if ag_proc or is_port_in_use("127.0.0.1", 9000):
-        print(f"- Antigravity: project {ANTIGRAVITY_PROJECT_DIR} (or already running on port 9000)")
-    if pc_proc:
-        print(f"- Phone Connect: {PHONE_CONNECT_DIR}")
-    if pw_proc or is_port_in_use(PHONE_WORKER_HOST, PHONE_WORKER_PORT):
-        print(f"- phone_worker: {PHONE_WORKER_URL}")
-    print("- file_monitor: http://127.0.0.1:8787")
-    print("- tg_bot: listening for Telegram updates")
-
-    print("\nPress Ctrl+C to stop all processes.\n")
+    print("\n" + "="*50)
+    print("🟢 Antigravity Assistant is running.")
+    print("   Open Telegram and message the bot.")
+    print("   Ctrl+C - stop everything.")
+    print("="*50 + "\n")
 
     try:
         while True:
-            time.sleep(1)
+            time.sleep(HEALTH_CHECK_INTERVAL)
+            for svc in services:
+                if not svc.is_alive() and svc.proc is not None:
+                    print(f"⚠️  {svc.name} fell!")
+                    svc.restart()
     except KeyboardInterrupt:
-        print("\n⏹ Stopping processes...")
-        for name, proc in processes:
-            if proc and proc.poll() is None:
-                print(f"→ Terminating {name} ...")
-                proc.terminate()
-        print("👋 Launcher finished.")
+        print("\n⏹ Stopping all services...")
+        for svc in reversed(services):
+            svc.stop()
+        print("👋 Done.")
 
 
 if __name__ == "__main__":

@@ -8,3 +8,6 @@ task_latest.md
 walkthrough_latest.md
 *.log
 artifacts/
+projects.json
+data/
+backup_old/
