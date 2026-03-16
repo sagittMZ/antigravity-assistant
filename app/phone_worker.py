@@ -20,11 +20,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import aiohttp
+import ssl as _ssl
 
 BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 # Phone Connect local URL (the Node.js server, NOT the ngrok tunnel)
+# Use https:// if Phone Connect has SSL certs generated
 PHONE_CONNECT_URL = os.getenv("PHONE_CONNECT_LOCAL_URL", "http://127.0.0.1:3000").rstrip("/")
 # Password for Phone Connect auth
 PHONE_CONNECT_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
@@ -34,6 +36,16 @@ app = FastAPI(title="Phone Worker — Antigravity Assistant")
 # Session cookie jar to persist auth between calls
 _cookie_jar: Optional[aiohttp.CookieJar] = None
 _authenticated = False
+
+
+def _make_ssl_context():
+    """Create a permissive SSL context for local self-signed certs."""
+    if PHONE_CONNECT_URL.startswith("https"):
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        return ctx
+    return None
 
 
 def get_cookie_jar() -> aiohttp.CookieJar:
@@ -73,7 +85,9 @@ async def ensure_auth(session: aiohttp.ClientSession) -> bool:
 async def pc_request(method: str, path: str, json_data: dict = None) -> dict:
     """Make an authenticated request to Phone Connect."""
     jar = get_cookie_jar()
-    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+    ssl_ctx = _make_ssl_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
+    async with aiohttp.ClientSession(cookie_jar=jar, connector=connector) as session:
         await ensure_auth(session)
 
         url = f"{PHONE_CONNECT_URL}{path}"

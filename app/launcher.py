@@ -74,6 +74,7 @@ class Service:
         if self.check_port and is_port_in_use("127.0.0.1", self.check_port):
             print(f"ℹ️  {self.name}: port {self.check_port} busy - may be already working.")
             self.started = True
+            self.proc = None  # Clear stale proc reference on port-busy reattach
             return
 
         log_path = LOG_DIR / f"{self.name}.log"
@@ -89,6 +90,11 @@ class Service:
         self.started = True
 
     def is_alive(self):
+        # If we have a check_port, use it as the primary health signal.
+        # This handles GUI apps (like Antigravity) that fork/detach:
+        # the wrapper process exits immediately, but the app keeps the port open.
+        if self.check_port and self.started:
+            return is_port_in_use("127.0.0.1", self.check_port)
         if self.proc is None:
             return self.started
         return self.proc.poll() is None
