@@ -35,7 +35,7 @@ All application code lives in the `app/` directory:
 ### Prerequisites
 - Python 3.8+
 - [Antigravity IDE](https://github.com/google-deepmind/antigravity) installed and in `PATH`.
-- Phone Connect project (fork of `antigravity_phone_chat`).
+- **Phone Connect**: This project requires [antigravity_phone_chat](https://github.com/krishnakanthb13/antigravity_phone_chat) (or your fork of it) to be set up.
 - Telegram bot token (from [@BotFather](https://t.me/botfather)) and your Telegram User ID.
 
 ### Installation
@@ -102,6 +102,12 @@ Use `Ctrl+C` in the launcher terminal to stop all services at once.
 ## 📝 Notes
 - **Brain Path**: Antigravity brain directory is expected at `~/.gemini/antigravity/brain`.
 - **Extensibility**: This project is designed to be extended with Git integration, additional remote control commands, etc.
+
+---
+
+## 🎖 Credits
+
+This project heavily relies on the work of **[Krishnakanth B](https://github.com/krishnakanthb13)** and his **[antigravity_phone_chat](https://github.com/krishnakanthb13/antigravity_phone_chat)** project, which provides the foundation for the mobile phone connection.
 
 ---
 
