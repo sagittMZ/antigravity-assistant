@@ -2,6 +2,7 @@
 file_monitor.py — FastAPI service for accessing Antigravity brain
 session artifacts and project files.
 """
+from __future__ import annotations
 
 import os
 import glob as glob_mod

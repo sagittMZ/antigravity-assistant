@@ -8,6 +8,7 @@ Phone Connect HTTP endpoints directly (the Node.js server exposes
 
 This keeps the architecture simpler and more reliable.
 """
+from __future__ import annotations
 
 import os
 import re

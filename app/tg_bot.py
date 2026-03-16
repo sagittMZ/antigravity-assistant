@@ -13,6 +13,7 @@ Features:
 - Manage multiple projects
 - Session logging
 """
+from __future__ import annotations
 
 import asyncio
 import json
