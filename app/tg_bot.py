@@ -69,7 +69,7 @@ SYSTEMD_SERVICE_NAME = os.getenv("SYSTEMD_SERVICE_NAME", "antigravity-assistant"
 # Polling interval for checking AI responses (seconds)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3.0"))
 # How long to poll for a response before giving up (seconds)
-POLL_TIMEOUT = float(os.getenv("POLL_TIMEOUT", "300"))
+POLL_TIMEOUT = float(os.getenv("POLL_TIMEOUT", "600"))
 # Background watcher interval — how often to check for changes when idle (seconds)
 BG_WATCH_INTERVAL = float(os.getenv("BG_WATCH_INTERVAL", "10.0"))
 
@@ -279,6 +279,61 @@ async def restart_service():
         return False, f"Restart error: {e}"
 
 
+# ---------- Content dedup ----------
+
+# Texts we have already sent to Telegram (prefix → full text).
+# Using first 120 chars as key: if a new message starts with the same
+# 120-char prefix, it is either a duplicate or a longer streaming version
+# of something we already sent.
+_sent_text_prefixes: dict[str, str] = {}  # prefix → last sent text
+
+
+def _text_prefix(text: str, length: int = 120) -> str:
+    """Return a stable prefix for dedup comparison."""
+    return text[:length].strip()
+
+
+def _is_duplicate(text: str) -> bool:
+    """Check if this text has already been sent (or is a substring of one).
+
+    Also catches the reverse: if we already sent a shorter version and now
+    the message grew (streaming), we skip it because the meaningful content
+    was already delivered.
+    """
+    prefix = _text_prefix(text)
+    if not prefix:
+        return True
+
+    # Exact prefix match — same message (possibly grew during streaming)
+    if prefix in _sent_text_prefixes:
+        return True
+
+    # Check if any previously sent text contains this text or vice versa
+    for sent_prefix, sent_full in _sent_text_prefixes.items():
+        # New text is a subset of something we already sent
+        if text in sent_full:
+            return True
+        # Something we sent is a subset of the new text (streaming grew it)
+        if sent_full in text:
+            # Update the stored version but still skip sending
+            _sent_text_prefixes[sent_prefix] = text
+            return True
+
+    return False
+
+
+def _mark_sent(text: str):
+    """Record that we sent this text to Telegram."""
+    prefix = _text_prefix(text)
+    if prefix:
+        _sent_text_prefixes[prefix] = text
+
+
+def _reset_sent_texts():
+    """Clear sent text tracker (e.g. on new chat)."""
+    _sent_text_prefixes.clear()
+
+
 # ---------- Message polling ----------
 
 async def get_current_messages() -> list[dict]:
@@ -305,7 +360,18 @@ async def get_snapshot_hash() -> Optional[str]:
 
 async def poll_for_response(chat_id: int, timeout: float = None):
     """Poll for new messages from Antigravity after a prompt was sent.
-    Sends new messages back to the Telegram chat."""
+
+    Keeps polling until:
+    - We delivered at least one assistant message AND the snapshot
+      has been stable for a while (AI finished responding), OR
+    - The timeout expires.
+
+    Key insight: while the AI is *thinking*, the snapshot HTML keeps
+    changing (thinking bubbles, progress bars) but the parser filters
+    all of that out, so we get 0 new meaningful messages.  We must NOT
+    treat those thinking-only changes as "the AI is still responding" —
+    instead we track stability separately.
+    """
     global _polling_active, _last_snapshot_hash, _waiting_for_response
     global _bg_last_hash, _bg_baseline_hashes
 
@@ -320,12 +386,22 @@ async def poll_for_response(chat_id: int, timeout: float = None):
     # Get initial snapshot hash
     _last_snapshot_hash = await get_snapshot_hash()
 
-    # Take a baseline of existing messages
+    # Take a baseline of existing messages AND register their texts
+    # so we never re-send content that was already visible.
     baseline = await get_current_messages()
     baseline_hashes = {m["hash"] for m in baseline}
+    for m in baseline:
+        _mark_sent(m["text"])
 
-    consecutive_same = 0
     prev_hash = _last_snapshot_hash
+    ever_sent = False          # Did we deliver at least one real message?
+    stable_polls = 0           # How many polls with NO snapshot change
+    # How many polls to wait for "stable" after we sent something:
+    #   10 polls * 3s = 30s of no change → done
+    STABLE_AFTER_SEND = 10
+    # How many polls to wait for "idle" when we never got a response:
+    #   50 polls * 3s = 150s (2.5 min) of total silence → give up
+    STABLE_NO_RESPONSE = 50
 
     try:
         while time.time() - start_time < effective_timeout:
@@ -334,34 +410,71 @@ async def poll_for_response(chat_id: int, timeout: float = None):
             current_hash = await get_snapshot_hash()
 
             if current_hash == prev_hash:
-                consecutive_same += 1
-                # If no changes for 15 consecutive polls (45 sec with 3s interval),
-                # AI has probably finished
-                if consecutive_same > 15 and consecutive_same > 5:
+                stable_polls += 1
+
+                # Exit conditions based on stability
+                if ever_sent and stable_polls >= STABLE_AFTER_SEND:
+                    # We already sent content and snapshot is stable → done
+                    break
+                if not ever_sent and stable_polls >= STABLE_NO_RESPONSE:
+                    # Never got content and snapshot stopped changing → AI
+                    # probably finished but response was all filtered out,
+                    # or something is stuck.  Do a final check and exit.
                     break
                 continue
 
-            consecutive_same = 0
+            # Snapshot changed
+            stable_polls = 0
             prev_hash = current_hash
 
-            # Snapshot changed — check for new messages
+            # Check for new meaningful messages
             current_msgs = await get_current_messages()
             new_msgs = [m for m in current_msgs if m["hash"] not in baseline_hashes]
 
             for msg in new_msgs:
                 baseline_hashes.add(msg["hash"])
 
-                role_emoji = "\U0001f916" if msg["role"] != "user" else "\U0001f464"
+                # Skip user messages — the user already knows what
+                # they sent; we only forward assistant responses.
+                if msg["role"] == "user":
+                    _mark_sent(msg["text"])
+                    continue
+
                 text = msg["text"]
 
-                # Send to Telegram (split long messages)
-                await send_long_message(chat_id, f"{role_emoji} {text}")
-                write_log("AI_RESPONSE", text[:200])
+                # Skip duplicates
+                if _is_duplicate(text):
+                    continue
 
-            # If we got assistant messages and snapshot stabilized, we can stop
-            assistant_msgs = [m for m in new_msgs if m["role"] != "user"]
-            if assistant_msgs and consecutive_same > 3:
-                break
+                await send_long_message(chat_id, f"\U0001f916 {text}")
+                _mark_sent(text)
+                write_log("AI_RESPONSE", text[:200])
+                ever_sent = True
+
+        # --- Final sweep ---
+        # When we exit the loop (timeout or stability), do one last fetch
+        # to catch any messages that appeared in the last moments.
+        try:
+            final_msgs = await get_current_messages()
+            for msg in final_msgs:
+                if msg["hash"] in baseline_hashes:
+                    continue
+                baseline_hashes.add(msg["hash"])
+                if msg["role"] == "user":
+                    _mark_sent(msg["text"])
+                    continue
+                text = msg["text"]
+                if _is_duplicate(text):
+                    continue
+                await send_long_message(chat_id, f"\U0001f916 {text}")
+                _mark_sent(text)
+                write_log("AI_RESPONSE_FINAL", text[:200])
+                ever_sent = True
+        except Exception:
+            pass
+
+        if not ever_sent:
+            write_log("POLL_TIMEOUT", "No AI response received during polling")
 
     except Exception as e:
         write_log("POLL_ERROR", str(e))
@@ -468,14 +581,23 @@ async def background_watcher():
             for msg in new_msgs:
                 _bg_baseline_hashes.add(msg["hash"])
 
-                role_emoji = "\U0001f916" if msg["role"] != "user" else "\U0001f464"
+                # Skip user messages (we only forward assistant responses)
+                if msg["role"] == "user":
+                    _mark_sent(msg["text"])
+                    continue
+
                 text = msg["text"]
+
+                # Skip if we already sent this content (dedup against polling)
+                if _is_duplicate(text):
+                    continue
 
                 try:
                     await send_long_message(
                         _active_chat_id,
-                        f"\U0001f4e1 {role_emoji} {text}",  # satellite emoji = from desktop
+                        f"\U0001f4e1 \U0001f916 {text}",  # satellite emoji = from desktop
                     )
+                    _mark_sent(text)
                     write_log("BG_MSG", text[:200])
                 except Exception as e:
                     write_log("BG_SEND_ERROR", str(e))
@@ -733,6 +855,7 @@ async def btn_new_chat(message: types.Message):
             _last_snapshot_hash = None
             _bg_last_hash = None
             _bg_baseline_hashes.clear()
+            _reset_sent_texts()
             current_session["thread_id"] = str(int(time.time()))
             save_session(current_session)
             write_log("SYSTEM", "New chat started via Telegram.")
