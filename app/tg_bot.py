@@ -10,14 +10,17 @@ Features:
 - View implementation plans, tasks, walkthroughs
 - Start new chats, stop generation
 - View brain session files
-- Manage multiple projects
+- Manage and switch between multiple projects
+- Launch/restart Antigravity with selected project from TG
 - Session logging
+- Background polling: detects new messages even when user works on desktop
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import subprocess
 import time
 import hashlib
 from datetime import datetime
@@ -29,6 +32,8 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent.parent
@@ -53,10 +58,20 @@ LOG_FILE = LOG_DIR / "agent.log"
 FILE_SERVICE_URL = os.getenv("FILE_SERVICE_URL", "http://127.0.0.1:8787").strip()
 PHONE_WORKER_URL = os.getenv("PHONE_WORKER_URL", "http://127.0.0.1:8788").strip()
 
+# Base directory containing all Antigravity projects
+PROJECTS_BASE_DIR = Path(
+    os.getenv("PROJECTS_BASE_DIR", str(Path.home() / "antigravity" / "projects"))
+)
+
+# systemd user service name for restart
+SYSTEMD_SERVICE_NAME = os.getenv("SYSTEMD_SERVICE_NAME", "antigravity-assistant")
+
 # Polling interval for checking AI responses (seconds)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3.0"))
 # How long to poll for a response before giving up (seconds)
 POLL_TIMEOUT = float(os.getenv("POLL_TIMEOUT", "300"))
+# Background watcher interval — how often to check for changes when idle (seconds)
+BG_WATCH_INTERVAL = float(os.getenv("BG_WATCH_INTERVAL", "10.0"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -68,6 +83,18 @@ _polling_active = False
 _last_snapshot_hash: Optional[str] = None
 _waiting_for_response = False
 _pending_status_msg: Optional[types.Message] = None
+
+# Background watcher state
+_bg_watcher_running = False
+_bg_last_hash: Optional[str] = None
+_bg_baseline_hashes: set[str] = set()
+_active_chat_id: Optional[int] = None
+
+
+# ---------- FSM for adding new project ----------
+
+class AddProjectStates(StatesGroup):
+    waiting_for_name = State()
 
 
 # ---------- Session / Projects ----------
@@ -86,14 +113,41 @@ def save_session(session_data: dict):
 
 
 def load_projects() -> list[dict]:
+    """Load project list from projects.json.
+
+    Each project: {"name": "...", "path": "/full/path/...", "active": bool}
+    If file doesn't exist, seed it from ANTIGRAVITY_PROJECT_DIR in .env.
+    """
     if PROJECTS_FILE.exists():
-        with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    # Default: use the one from .env
+        try:
+            with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
+                projects = json.load(f)
+            if isinstance(projects, list) and projects:
+                return projects
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Seed from .env default
     default_path = os.getenv("ANTIGRAVITY_PROJECT_DIR", "")
     if default_path:
-        return [{"name": Path(default_path).name, "path": default_path, "active": True}]
-    return []
+        projects = [{"name": Path(default_path).name, "path": default_path, "active": True}]
+    else:
+        projects = []
+
+    # Auto-discover existing project directories
+    if PROJECTS_BASE_DIR.exists():
+        for d in sorted(PROJECTS_BASE_DIR.iterdir()):
+            if d.is_dir() and not d.name.startswith("."):
+                already = any(p["path"] == str(d) for p in projects)
+                if not already:
+                    projects.append({
+                        "name": d.name,
+                        "path": str(d),
+                        "active": len(projects) == 0,
+                    })
+
+    save_projects(projects)
+    return projects
 
 
 def save_projects(projects: list[dict]):
@@ -107,6 +161,53 @@ def get_active_project() -> Optional[dict]:
         if p.get("active"):
             return p
     return projects[0] if projects else None
+
+
+def set_active_project(project_name: str) -> Optional[dict]:
+    """Set a project as active by name. Returns the activated project or None."""
+    projects = load_projects()
+    target = None
+    for p in projects:
+        if p["name"] == project_name:
+            p["active"] = True
+            target = p
+        else:
+            p["active"] = False
+    if target:
+        save_projects(projects)
+    return target
+
+
+def add_project(name: str) -> dict:
+    """Add a new project by name. Path = PROJECTS_BASE_DIR / name.
+    Returns the new project dict.
+    """
+    projects = load_projects()
+
+    # Check if already exists
+    for p in projects:
+        if p["name"] == name:
+            return p
+
+    project_path = str(PROJECTS_BASE_DIR / name)
+    new_project = {"name": name, "path": project_path, "active": False}
+    projects.append(new_project)
+    save_projects(projects)
+    return new_project
+
+
+def remove_project(name: str) -> bool:
+    """Remove a project from the list (does not delete files)."""
+    projects = load_projects()
+    original_len = len(projects)
+    projects = [p for p in projects if p["name"] != name]
+    if len(projects) < original_len:
+        # If we removed the active project, activate the first one
+        if projects and not any(p.get("active") for p in projects):
+            projects[0]["active"] = True
+        save_projects(projects)
+        return True
+    return False
 
 
 current_session = load_session()
@@ -154,6 +255,30 @@ async def fm_get(path: str) -> str:
             raise RuntimeError(f"HTTP {resp.status}: {text}")
 
 
+# ---------- Service restart ----------
+
+async def restart_service():
+    """Restart the systemd user service (the whole launcher).
+
+    This is how we apply a project switch: bot updates projects.json,
+    then restarts the launcher which reads the new active project.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "--user", "restart", SYSTEMD_SERVICE_NAME,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            return True, "Service restarted."
+        else:
+            err = stderr.decode().strip() or stdout.decode().strip()
+            return False, f"Restart failed: {err}"
+    except Exception as e:
+        return False, f"Restart error: {e}"
+
+
 # ---------- Message polling ----------
 
 async def get_current_messages() -> list[dict]:
@@ -179,9 +304,10 @@ async def get_snapshot_hash() -> Optional[str]:
 
 
 async def poll_for_response(chat_id: int, timeout: float = None):
-    """Poll for new messages from Antigravity.
+    """Poll for new messages from Antigravity after a prompt was sent.
     Sends new messages back to the Telegram chat."""
     global _polling_active, _last_snapshot_hash, _waiting_for_response
+    global _bg_last_hash, _bg_baseline_hashes
 
     if _polling_active:
         return
@@ -243,6 +369,9 @@ async def poll_for_response(chat_id: int, timeout: float = None):
     finally:
         _polling_active = False
         _waiting_for_response = False
+        # Update background watcher baseline so it doesn't re-send these messages
+        _bg_last_hash = prev_hash
+        _bg_baseline_hashes = baseline_hashes
 
 
 async def send_long_message(chat_id: int, text: str, **kwargs):
@@ -272,6 +401,93 @@ async def send_long_message(chat_id: int, text: str, **kwargs):
         await bot.send_message(chat_id, part, **kwargs)
 
 
+# ---------- Background watcher ----------
+
+async def background_watcher():
+    """Periodically check for new Antigravity messages even when user
+    works on the desktop.  Runs as a long-lived asyncio task.
+
+    Logic:
+    - Every BG_WATCH_INTERVAL seconds, fetch the snapshot hash.
+    - If hash changed AND active polling is not running, fetch messages
+      and forward any truly new ones to Telegram.
+    - Skips cycles while poll_for_response is active (to avoid duplicates).
+    """
+    global _bg_watcher_running, _bg_last_hash, _bg_baseline_hashes
+
+    if _bg_watcher_running:
+        return
+    _bg_watcher_running = True
+
+    write_log("BG_WATCHER", "Background watcher started")
+
+    # Wait a bit on startup for phone_worker to be reachable
+    await asyncio.sleep(5)
+
+    try:
+        while True:
+            await asyncio.sleep(BG_WATCH_INTERVAL)
+
+            # Skip if active polling is running (prompt-triggered)
+            if _polling_active:
+                continue
+
+            # Skip if we don't know which chat to send to
+            if _active_chat_id is None:
+                continue
+
+            try:
+                current_hash = await get_snapshot_hash()
+            except Exception:
+                continue
+
+            # No change — nothing to do
+            if current_hash is None or current_hash == _bg_last_hash:
+                continue
+
+            _bg_last_hash = current_hash
+
+            # Snapshot changed — check for new messages
+            try:
+                current_msgs = await get_current_messages()
+            except Exception:
+                continue
+
+            if not current_msgs:
+                continue
+
+            new_msgs = [
+                m for m in current_msgs
+                if m["hash"] not in _bg_baseline_hashes
+            ]
+
+            if not new_msgs:
+                # Hash changed but no new parseable messages (e.g. typing indicator)
+                continue
+
+            for msg in new_msgs:
+                _bg_baseline_hashes.add(msg["hash"])
+
+                role_emoji = "\U0001f916" if msg["role"] != "user" else "\U0001f464"
+                text = msg["text"]
+
+                try:
+                    await send_long_message(
+                        _active_chat_id,
+                        f"\U0001f4e1 {role_emoji} {text}",  # satellite emoji = from desktop
+                    )
+                    write_log("BG_MSG", text[:200])
+                except Exception as e:
+                    write_log("BG_SEND_ERROR", str(e))
+
+    except asyncio.CancelledError:
+        write_log("BG_WATCHER", "Background watcher stopped")
+    except Exception as e:
+        write_log("BG_WATCHER_ERROR", f"Unexpected error: {e}")
+    finally:
+        _bg_watcher_running = False
+
+
 # ---------- Keyboards ----------
 
 def get_main_menu():
@@ -283,10 +499,11 @@ def get_main_menu():
     builder.button(text="Mode/Model")
     builder.button(text="New Chat")
     builder.button(text="Stop")
-    builder.button(text="Logs")
+    builder.button(text="Projects")
     builder.button(text="Brain Files")
     builder.button(text="Status")
-    builder.adjust(3, 3, 2, 2)
+    builder.button(text="Logs")
+    builder.adjust(3, 3, 3, 2)
     return builder.as_markup(resize_keyboard=True, is_persistent=True)
 
 
@@ -360,6 +577,32 @@ def get_settings_keyboard():
     return builder.as_markup()
 
 
+def get_projects_keyboard():
+    """Build inline keyboard with project list and management actions."""
+    projects = load_projects()
+    builder = InlineKeyboardBuilder()
+
+    for p in projects:
+        marker = "\u2705 " if p.get("active") else ""
+        label = f"{marker}{p['name']}"
+        cb_data = f"proj_select_{p['name']}"[:64]
+        builder.button(text=label, callback_data=cb_data)
+
+    builder.adjust(1)  # One project per row
+
+    # Action buttons at the bottom
+    builder.row(
+        InlineKeyboardButton(text="\u2795 Add project", callback_data="proj_add"),
+        InlineKeyboardButton(text="\U0001f680 Launch", callback_data="proj_launch"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="\U0001f5d1 Remove", callback_data="proj_remove_menu"),
+        InlineKeyboardButton(text="\U0001f504 Scan folder", callback_data="proj_scan"),
+    )
+
+    return builder.as_markup()
+
+
 # ---------- Auth ----------
 
 def is_allowed(user_id: int) -> bool:
@@ -373,8 +616,14 @@ async def cmd_start(message: types.Message):
     if not is_allowed(message.from_user.id):
         return
 
+    global _active_chat_id
+    _active_chat_id = message.chat.id
+
+    project = get_active_project()
+    project_info = f"\nActive project: *{project['name']}*" if project else ""
+
     await message.answer(
-        "*Antigravity Assistant*\n\n"
+        f"*Antigravity Assistant*\n{project_info}\n\n"
         "Send any text as a prompt to Antigravity AI.\n"
         "Use buttons for quick actions:\n\n"
         "*Prompt* — type and send prompt\n"
@@ -384,6 +633,7 @@ async def cmd_start(message: types.Message):
         "*Mode/Model* — switch mode or model\n"
         "*New Chat* — start new conversation\n"
         "*Stop* — stop current generation\n"
+        "*Projects* — switch or launch a project\n"
         "*Brain Files* — latest session files\n"
         "*Status* — connectivity status",
         parse_mode="Markdown",
@@ -408,6 +658,12 @@ async def btn_status(message: types.Message):
 async def show_status(message: types.Message):
     await bot.send_chat_action(message.chat.id, "typing")
     status_parts = []
+
+    # Active project
+    project = get_active_project()
+    if project:
+        status_parts.append(f"Project: {project['name']}")
+        status_parts.append(f"   Path: {project['path']}")
 
     # Phone Worker health
     try:
@@ -444,10 +700,9 @@ async def show_status(message: types.Message):
     except Exception:
         status_parts.append("File Monitor: unreachable")
 
-    # Active project
-    project = get_active_project()
-    if project:
-        status_parts.append(f"Project: {project['name']}")
+    # Background watcher status
+    watcher_status = "active" if _bg_watcher_running else "stopped"
+    status_parts.append(f"Background watcher: {watcher_status}")
 
     await message.answer("\n".join(status_parts), reply_markup=get_main_menu())
 
@@ -473,8 +728,11 @@ async def btn_new_chat(message: types.Message):
         result = await pw_post("/new-chat")
         if result.get("success") or result.get("method"):
             global _known_message_hashes, _last_snapshot_hash
+            global _bg_last_hash, _bg_baseline_hashes
             _known_message_hashes.clear()
             _last_snapshot_hash = None
+            _bg_last_hash = None
+            _bg_baseline_hashes.clear()
             current_session["thread_id"] = str(int(time.time()))
             save_session(current_session)
             write_log("SYSTEM", "New chat started via Telegram.")
@@ -576,6 +834,237 @@ async def cb_set_model(callback: types.CallbackQuery):
             await callback.message.answer(f"Error: {result.get('error', 'Unknown error')}", reply_markup=get_main_menu())
     except Exception as e:
         await callback.message.answer(f"Error: {e}", reply_markup=get_main_menu())
+    await callback.answer()
+
+
+# ----- Projects management -----
+
+@dp.message(F.text == "Projects")
+async def btn_projects(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
+
+    project = get_active_project()
+    active_name = project["name"] if project else "none"
+    projects = load_projects()
+
+    text = (
+        f"*Projects* ({len(projects)} total)\n"
+        f"Active: *{active_name}*\n\n"
+        "Tap a project to select it.\n"
+        "Then tap Launch to restart Antigravity with it."
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=get_projects_keyboard())
+
+
+@dp.callback_query(F.data.startswith("proj_select_"))
+async def cb_project_select(callback: types.CallbackQuery):
+    """Select a project as active."""
+    if not is_allowed(callback.from_user.id):
+        return
+
+    name = callback.data.replace("proj_select_", "")
+    project = set_active_project(name)
+
+    if project:
+        await callback.message.edit_text(
+            f"Active project set to: *{name}*\n"
+            f"Path: `{project['path']}`\n\n"
+            "Press Launch to restart Antigravity with this project.",
+            parse_mode="Markdown",
+            reply_markup=get_projects_keyboard(),
+        )
+    else:
+        await callback.message.answer(f"Project not found: {name}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "proj_launch")
+async def cb_project_launch(callback: types.CallbackQuery):
+    """Restart the whole service to launch Antigravity with the active project."""
+    if not is_allowed(callback.from_user.id):
+        return
+
+    project = get_active_project()
+    if not project:
+        await callback.message.answer("No active project selected.")
+        await callback.answer()
+        return
+
+    project_path = Path(project["path"])
+    if not project_path.exists():
+        await callback.message.answer(
+            f"Project directory does not exist:\n`{project['path']}`\n\n"
+            "Create the directory first or choose another project.",
+            parse_mode="Markdown",
+        )
+        await callback.answer()
+        return
+
+    await callback.message.answer(
+        f"Restarting Antigravity with project: *{project['name']}*\n"
+        "The bot will be back in ~15 seconds...",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu(),
+    )
+    await callback.answer()
+
+    write_log("PROJECT", f"Launching project: {project['name']} at {project['path']}")
+
+    # Restart the systemd service — this will kill this bot process too
+    ok, msg = await restart_service()
+    if not ok:
+        # If restart failed, we're still alive — tell the user
+        await callback.message.answer(
+            f"Could not restart service: {msg}\n\n"
+            "You can restart manually:\n"
+            f"`systemctl --user restart {SYSTEMD_SERVICE_NAME}`",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu(),
+        )
+
+
+@dp.callback_query(F.data == "proj_add")
+async def cb_project_add(callback: types.CallbackQuery, state: FSMContext):
+    """Ask user to type a project name."""
+    if not is_allowed(callback.from_user.id):
+        return
+
+    await callback.message.answer(
+        f"Enter project name (directory name inside `{PROJECTS_BASE_DIR}`):\n\n"
+        "For example: `my-new-project`\n\n"
+        "Type /cancel to abort.",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu(),
+    )
+    await state.set_state(AddProjectStates.waiting_for_name)
+    await callback.answer()
+
+
+@dp.message(AddProjectStates.waiting_for_name, Command("cancel"))
+async def cancel_add_project(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Cancelled.", reply_markup=get_main_menu())
+
+
+@dp.message(AddProjectStates.waiting_for_name)
+async def process_new_project_name(message: types.Message, state: FSMContext):
+    """User typed a project name — add it to the list."""
+    if not is_allowed(message.from_user.id):
+        return
+
+    name = message.text.strip()
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        await message.answer(
+            "Invalid project name. Use a simple directory name like `my-project`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    project = add_project(name)
+    project_path = Path(project["path"])
+    exists = project_path.exists()
+
+    status = "exists on disk" if exists else "will be created by Antigravity on first run"
+
+    await state.clear()
+    await message.answer(
+        f"Project added: *{name}*\n"
+        f"Path: `{project['path']}`\n"
+        f"Status: {status}\n\n"
+        "Open Projects to select and launch it.",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu(),
+    )
+    write_log("PROJECT", f"Added project: {name}")
+
+
+@dp.callback_query(F.data == "proj_remove_menu")
+async def cb_project_remove_menu(callback: types.CallbackQuery):
+    """Show a list of projects to remove."""
+    if not is_allowed(callback.from_user.id):
+        return
+
+    projects = load_projects()
+    if len(projects) <= 1:
+        await callback.message.answer("Cannot remove the last project.")
+        await callback.answer()
+        return
+
+    builder = InlineKeyboardBuilder()
+    for p in projects:
+        cb_data = f"proj_rm_{p['name']}"[:64]
+        builder.button(text=f"\u274c {p['name']}", callback_data=cb_data)
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="Cancel", callback_data="proj_rm_cancel"))
+
+    await callback.message.answer(
+        "Select project to remove from the list\n(files will NOT be deleted):",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("proj_rm_"))
+async def cb_project_remove(callback: types.CallbackQuery):
+    if not is_allowed(callback.from_user.id):
+        return
+
+    if callback.data == "proj_rm_cancel":
+        await callback.message.delete()
+        await callback.answer()
+        return
+
+    name = callback.data.replace("proj_rm_", "")
+    removed = remove_project(name)
+
+    if removed:
+        await callback.message.edit_text(
+            f"Project removed from list: {name}\n(files not deleted)",
+        )
+        write_log("PROJECT", f"Removed project from list: {name}")
+    else:
+        await callback.message.edit_text(f"Project not found: {name}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "proj_scan")
+async def cb_project_scan(callback: types.CallbackQuery):
+    """Scan PROJECTS_BASE_DIR for project folders and add any missing ones."""
+    if not is_allowed(callback.from_user.id):
+        return
+
+    if not PROJECTS_BASE_DIR.exists():
+        await callback.message.answer(
+            f"Projects base directory not found:\n`{PROJECTS_BASE_DIR}`",
+            parse_mode="Markdown",
+        )
+        await callback.answer()
+        return
+
+    projects = load_projects()
+    existing_paths = {p["path"] for p in projects}
+    added = []
+
+    for d in sorted(PROJECTS_BASE_DIR.iterdir()):
+        if d.is_dir() and not d.name.startswith(".") and str(d) not in existing_paths:
+            projects.append({
+                "name": d.name,
+                "path": str(d),
+                "active": False,
+            })
+            added.append(d.name)
+
+    if added:
+        save_projects(projects)
+        await callback.message.answer(
+            f"Found {len(added)} new project(s):\n" + "\n".join(f"  {n}" for n in added),
+            reply_markup=get_projects_keyboard(),
+        )
+        write_log("PROJECT", f"Scanned and added: {', '.join(added)}")
+    else:
+        await callback.message.answer("No new project directories found.")
+
     await callback.answer()
 
 
@@ -718,6 +1207,9 @@ async def handle_prompt(message: types.Message):
     if not is_allowed(message.from_user.id):
         return
 
+    global _active_chat_id
+    _active_chat_id = message.chat.id
+
     text = message.text.strip()
     if not text:
         return
@@ -726,7 +1218,7 @@ async def handle_prompt(message: types.Message):
     button_texts = {
         "Prompt", "Plan", "Task", "Walkthrough",
         "Mode/Model", "New Chat", "Stop", "Logs",
-        "Brain Files", "Status",
+        "Brain Files", "Status", "Projects",
     }
     if text in button_texts:
         return
@@ -763,6 +1255,10 @@ async def handle_prompt(message: types.Message):
 
 async def main():
     print("Telegram bot started. Waiting for updates...")
+
+    # Start the background watcher alongside the bot polling
+    asyncio.create_task(background_watcher())
+
     await dp.start_polling(bot)
 
 

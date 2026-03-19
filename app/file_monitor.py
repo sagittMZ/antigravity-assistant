@@ -20,10 +20,18 @@ PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", os.getenv(
 ))).expanduser()
 
 
+# Directories inside brain/ that are NOT real session directories
+_BRAIN_EXCLUDE_DIRS = {"tempmediaStorage", "temp", ".tmp"}
+
+
 def find_latest_dir() -> Path:
     if not os.path.isdir(BRAIN_DIR):
         raise FileNotFoundError(f"Brain dir not found: {BRAIN_DIR}")
-    dirs = [Path(p) for p in glob_mod.glob(f"{BRAIN_DIR}/*") if os.path.isdir(p)]
+    dirs = [
+        Path(p)
+        for p in glob_mod.glob(f"{BRAIN_DIR}/*")
+        if os.path.isdir(p) and Path(p).name not in _BRAIN_EXCLUDE_DIRS
+    ]
     if not dirs:
         raise FileNotFoundError("No brain sessions found")
     return max(dirs, key=lambda p: p.stat().st_mtime)

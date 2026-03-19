@@ -207,19 +207,120 @@ async def init_session():
 
 # ---------- HTML parsing helper ----------
 
+# Regex patterns compiled once at module level for performance
+
+# Patterns to remove entire blocks (tag + content)
+_RE_REMOVE_BLOCKS = re.compile(
+    r'<(?:style|script|noscript|template|svg|canvas)[^>]*>.*?</(?:style|script|noscript|template|svg|canvas)>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# xterm / terminal containers — match the opening tag through its closing tag
+# Antigravity uses xterm.js for terminal output; these elements contain raw
+# escape sequences, ANSI codes, rows of styled spans, etc.
+_RE_XTERM_BLOCKS = re.compile(
+    r'<div[^>]*class="[^"]*(?:xterm|terminal)[^"]*"[^>]*>.*?</div>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Code editor containers (CodeMirror / Monaco)
+_RE_EDITOR_BLOCKS = re.compile(
+    r'<div[^>]*class="[^"]*(?:cm-editor|cm-content|cm-gutters|monaco-editor|editor-container)[^"]*"[^>]*>.*?</div>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Inline CSS rules that leak into text (e.g. "body { ... }" or ".class { ... }")
+_RE_CSS_RULES = re.compile(
+    r'(?:^|\n)\s*(?:[\w\-.*#@:>\[\]=~^|,\s]+)\s*\{[^}]*\}',
+    re.MULTILINE,
+)
+
+# ANSI / terminal escape sequences
+_RE_ANSI = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+# Repeated special characters that indicate decorative lines / progress bars
+_RE_DECORATIVE_LINES = re.compile(r'[─━═▓░▒█▄▀]{4,}')
+
+# Git command output noise patterns
+_RE_GIT_NOISE = re.compile(
+    r'(?:^|\n)\s*(?:'
+    r'diff --git\b|index [0-9a-f]+\.\.[0-9a-f]+|'
+    r'--- a/|'
+    r'\+\+\+ b/|'
+    r'@@ .+? @@|'
+    r'commit [0-9a-f]{7,40}\b|'
+    r'Author:\s|'
+    r'Date:\s|'
+    r'Merge:\s|'
+    r'(?:modified|deleted|renamed|new file):\s+'
+    r').*',
+    re.MULTILINE,
+)
+
+# npm / shell progress noise
+_RE_SHELL_NOISE = re.compile(
+    r'(?:^|\n)\s*(?:'
+    r'npm\s+(?:warn|info|notice|WARN|ERR!)\b|'
+    r'\$\s+\S|'
+    r'>\s+\S+@\S+\s|'
+    r'added \d+ packages?\b|'
+    r'found \d+ vulnerabilities?\b|'
+    r'up to date\b|'
+    r'✓|✗|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏'
+    r').*',
+    re.MULTILINE,
+)
+
+# Strip HTML tags
+_RE_TAGS = re.compile(r'<[^>]+>')
+
+# Collapse whitespace
+_RE_MULTI_NEWLINES = re.compile(r'\n{3,}')
+_RE_MULTI_SPACES = re.compile(r'[ \t]{2,}')
+
+
+def _strip_noise(text: str) -> str:
+    """Remove technical garbage from extracted text."""
+    text = _RE_ANSI.sub('', text)
+    text = _RE_CSS_RULES.sub('', text)
+    text = _RE_GIT_NOISE.sub('', text)
+    text = _RE_SHELL_NOISE.sub('', text)
+    text = _RE_DECORATIVE_LINES.sub('', text)
+    return text
+
+
 def parse_messages_from_html(html: str) -> list[dict]:
+    """Parse snapshot HTML into clean message objects.
+
+    The HTML comes from Antigravity's chat panel via CDP captureSnapshot.
+    It may contain terminal output, xterm elements, CSS rules, git diffs,
+    progress bars, and other UI noise that must be filtered out.
+    """
     messages = []
-    text = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
-    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
-    blocks = re.split(r'(?=<div[^>]*(?:data-message|class="[^"]*message)[^>]*>)', html)
+
+    # Phase 1: Remove entire noisy DOM blocks
+    cleaned = _RE_REMOVE_BLOCKS.sub('', html)
+    cleaned = _RE_XTERM_BLOCKS.sub('', cleaned)
+    cleaned = _RE_EDITOR_BLOCKS.sub('', cleaned)
+
+    # Phase 2: Try to split by message blocks (data-message or class=message)
+    blocks = re.split(r'(?=<div[^>]*(?:data-message|class="[^"]*message)[^>]*>)', cleaned)
 
     if len(blocks) <= 1:
-        cleaned = re.sub(r'<[^>]+>', '\n', html)
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        lines = [l.strip() for l in cleaned.split('\n') if l.strip() and len(l.strip()) > 2]
+        # No message containers found — fallback to text extraction
+        text = _RE_TAGS.sub('\n', cleaned)
+        text = _strip_noise(text)
+        text = _RE_MULTI_SPACES.sub(' ', text)
+        text = _RE_MULTI_NEWLINES.sub('\n\n', text).strip()
+
+        # Split into logical chunks by double newlines
+        lines = [l.strip() for l in text.split('\n') if l.strip() and len(l.strip()) > 2]
         if lines:
             current_block = []
             for line in lines:
+                # Skip lines that look like CSS or technical noise
+                if _is_noise_line(line):
+                    continue
                 current_block.append(line)
                 if len('\n'.join(current_block)) > 200:
                     text_content = '\n'.join(current_block)
@@ -231,24 +332,89 @@ def parse_messages_from_html(html: str) -> list[dict]:
                     current_block = []
             if current_block:
                 text_content = '\n'.join(current_block)
-                messages.append({
-                    "role": "unknown",
-                    "text": text_content[:2000],
-                    "hash": hashlib.md5(text_content.encode()).hexdigest()[:8],
-                })
+                if len(text_content.strip()) > 5:
+                    messages.append({
+                        "role": "unknown",
+                        "text": text_content[:2000],
+                        "hash": hashlib.md5(text_content.encode()).hexdigest()[:8],
+                    })
     else:
         for block in blocks[1:]:
-            cleaned = re.sub(r'<[^>]+>', ' ', block)
-            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-            if len(cleaned) < 5:
+            # Remove nested noisy elements within each block
+            block_cleaned = _RE_XTERM_BLOCKS.sub('', block)
+            block_cleaned = _RE_EDITOR_BLOCKS.sub('', block_cleaned)
+
+            text = _RE_TAGS.sub(' ', block_cleaned)
+            text = _strip_noise(text)
+            text = _RE_MULTI_SPACES.sub(' ', text).strip()
+
+            if len(text) < 5:
                 continue
+
+            # Skip blocks that are entirely noise
+            if _is_noise_block(text):
+                continue
+
             role = "assistant"
             if 'user' in block.lower()[:200]:
                 role = "user"
+
             messages.append({
                 "role": role,
-                "text": cleaned[:2000],
-                "hash": hashlib.md5(cleaned.encode()).hexdigest()[:8],
+                "text": text[:2000],
+                "hash": hashlib.md5(text.encode()).hexdigest()[:8],
             })
 
     return messages
+
+
+def _is_noise_line(line: str) -> bool:
+    """Check if a single line looks like technical noise."""
+    stripped = line.strip()
+
+    # Very short lines are usually artifacts
+    if len(stripped) < 3:
+        return True
+
+    # CSS-like patterns
+    if re.match(r'^[\w\-.*#@:>\[\]=~^|,\s]+\s*\{', stripped):
+        return True
+    if stripped.endswith('}') and '{' not in stripped:
+        return True
+
+    # CSS property lines
+    if re.match(r'^\s*[\w-]+\s*:\s*[^;]+;\s*$', stripped):
+        return True
+
+    # Terminal prompt or command patterns
+    if re.match(r'^\s*[\$#>]\s+', stripped):
+        return True
+
+    # Hex color codes / CSS values standing alone
+    if re.match(r'^(?:#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|var\(--[^)]+\))\s*;?\s*$', stripped):
+        return True
+
+    # File paths standing alone (not in sentence context)
+    if re.match(r'^(?:/[\w\-./]+|\.{1,2}/[\w\-./]+)\s*$', stripped):
+        return True
+
+    # Repeated dots / dashes / underscores (progress indicators)
+    if re.match(r'^[.\-_=]{5,}$', stripped):
+        return True
+
+    return False
+
+
+def _is_noise_block(text: str) -> bool:
+    """Check if an entire text block is technical noise."""
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if not lines:
+        return True
+
+    noise_count = sum(1 for l in lines if _is_noise_line(l))
+
+    # If more than 70% of lines are noise, skip the whole block
+    if len(lines) > 0 and noise_count / len(lines) > 0.7:
+        return True
+
+    return False

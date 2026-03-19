@@ -1,12 +1,18 @@
 """
 launcher.py — Unified launcher for all Antigravity Assistant services.
+
+Reads the active project from projects.json (if it exists) or falls back
+to ANTIGRAVITY_PROJECT_DIR from .env.  The TG bot can switch projects by
+updating projects.json and then restarting this service via
+    systemctl --user restart antigravity-assistant
 """
 
+import json
 import os
+import signal
 import socket
 import subprocess
 import sys
-import signal
 import time
 from pathlib import Path
 import urllib.request
@@ -24,9 +30,42 @@ VENV_PYTHON = PROJECT_DIR / "venv" / "bin" / "python"
 if not VENV_PYTHON.exists():
     VENV_PYTHON = Path(sys.executable)
 
-ANTIGRAVITY_PROJECT_DIR = Path(
-    os.getenv("ANTIGRAVITY_PROJECT_DIR", str(HOME / "antigravity" / "projects" / "crewtask-v2"))
+# ---------- Project resolution ----------
+
+PROJECTS_FILE = BASE_DIR / "projects.json"
+
+# Base directory that contains all Antigravity projects
+# e.g. /home/sagitt/antigravity/projects
+PROJECTS_BASE_DIR = Path(
+    os.getenv("PROJECTS_BASE_DIR", str(HOME / "antigravity" / "projects"))
 )
+
+# Default project from .env (used as fallback)
+_DEFAULT_PROJECT_DIR = os.getenv(
+    "ANTIGRAVITY_PROJECT_DIR",
+    str(HOME / "antigravity" / "projects" / "crewtask-v2"),
+)
+
+
+def resolve_active_project() -> Path:
+    """Determine which project directory to open in Antigravity.
+
+    Priority:
+    1. Active project in projects.json
+    2. ANTIGRAVITY_PROJECT_DIR from .env
+    """
+    if PROJECTS_FILE.exists():
+        try:
+            with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
+                projects = json.load(f)
+            for p in projects:
+                if p.get("active"):
+                    return Path(p["path"])
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return Path(_DEFAULT_PROJECT_DIR)
+
+
 PHONE_CONNECT_DIR = Path(
     os.getenv("PHONE_CONNECT_DIR", str(HOME / "antigravity_phone_chat"))
 )
@@ -78,7 +117,7 @@ class Service:
             return
 
         log_path = LOG_DIR / f"{self.name}.log"
-        print(f"→ Запуск {self.name}: {' '.join(str(c) for c in self.cmd)}")
+        print(f"→ Starting {self.name}: {' '.join(str(c) for c in self.cmd)}")
         self.log_file = open(log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [str(c) for c in self.cmd],
@@ -160,9 +199,12 @@ def find_and_kill_extra_antigravity():
 
 
 def main():
+    # Resolve which project to open
+    antigravity_project_dir = resolve_active_project()
+
     print("🚀 Launcher: starting Antigravity Assistant")
     print(f"   Project DIRECTORY: {PROJECT_DIR}")
-    print(f"   Antigravity: {ANTIGRAVITY_PROJECT_DIR}")
+    print(f"   Antigravity project: {antigravity_project_dir}")
     print(f"   Phone Connect: {PHONE_CONNECT_DIR}")
     print()
 
@@ -170,16 +212,16 @@ def main():
 
     # 1. Antigravity IDE
     if LAUNCH_ANTIGRAVITY:
-        if ANTIGRAVITY_PROJECT_DIR.exists():
+        if antigravity_project_dir.exists():
             find_and_kill_extra_antigravity()
             services.append(Service(
                 name="Antigravity",
                 cmd=["antigravity", ".", f"--remote-debugging-port={ANTIGRAVITY_DEBUG_PORT}"],
-                cwd=ANTIGRAVITY_PROJECT_DIR,
+                cwd=antigravity_project_dir,
                 check_port=ANTIGRAVITY_DEBUG_PORT,
             ))
         else:
-            print(f"⚠️  The directory named Antigravity was not found: {ANTIGRAVITY_PROJECT_DIR}")
+            print(f"⚠️  The directory named Antigravity was not found: {antigravity_project_dir}")
     else:
         print("ℹ️  LAUNCH_ANTIGRAVITY=false - skipping.")
 
