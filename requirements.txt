@@ -4,3 +4,4 @@ python-dotenv
 fastapi
 uvicorn
 pydantic
+beautifulsoup4==4.14.3
