@@ -192,7 +192,7 @@ _RE_FRAGMENT = re.compile(r'^[A-Za-z]+[),.:;]+$')
 _RE_GIT = re.compile(
     r'(?:^|\n)\s*(?:'
     r'diff --git\b|index [0-9a-f]+\.\.[0-9a-f]+|'
-    r]--- a/|'
+    r'--- a/|'
     r'\+\+\+ b/|'
     r'@@ .+? @@|'
     r'commit [0-9a-f]{7,40}\b|'
