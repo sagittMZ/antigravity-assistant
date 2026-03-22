@@ -293,19 +293,14 @@ def parse_messages_from_html(html: str) -> list[dict]:
     blocks = soup.find_all(lambda t: t.name == "div" and (t.has_attr("data-message") or any("message" in c.lower() for c in t.get("class", []))))
 
     if not blocks:
-        # Fallback: if no specific blocks found, extract all clean text from body
-        text = soup.get_text(separator="\n\n", strip=True)
+        # Fallback
+        text = soup.get_text(separator=" ", strip=True) # ИЗМЕНЕНО
         text = _clean_text(text)
-        if _is_meaningful(text):
-            messages.append({
-                "role": "unknown",
-                "text": text,
-                "hash": _stable_hash(text)
-            })
+        # ...
     else:
         # Structured extraction
         for block in blocks:
-            text = block.get_text(separator="\n\n", strip=True)
+            text = block.get_text(separator=" ", strip=True) # ИЗМЕНЕНО
             text = _clean_text(text)
             if not _is_meaningful(text):
                 continue
