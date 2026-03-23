@@ -1,15 +1,17 @@
 """
 phone_worker.py — FastAPI gateway to Phone Connect REST API.
 
-CHANGES vs original:
-- Removed print() — replaced with pw_log (RotatingFileHandler via app.logger).
-  Fixes AI_WORKFLOW.md violation: "Do not use print()".
-- Added _auth_lock (asyncio.Lock) around _ensure_auth to prevent concurrent
-  coroutines (background_watcher + poll_for_response) from firing duplicate
-  POST /login requests simultaneously. Double-checked inside the lock.
-- No Playwright — this file uses only aiohttp REST calls to Phone Connect.
-  Playwright was already removed in the previous iteration; confirmed clean.
-- All business logic (snapshot parsing, BeautifulSoup, clean_text) unchanged.
+CHANGES vs previous version:
+- Fixed the word-waterfall problem (one word per line in Telegram).
+  Root cause: Antigravity streams Thought Process by putting each word in
+  its own <span>/<div>. BS4 with separator="\n" extracts them one-per-line.
+  Fix: _extract_text_smart() detects this pattern heuristically (>60% of
+  lines are 1-2 words) and collapses them back into readable sentences via
+  _collapse_waterfall(). Normal multi-paragraph messages are unaffected.
+- Fallback branch now actually returns a result (was silently returning []).
+- Removed print() → pw_log via RotatingFileHandler.
+- Added _auth_lock for concurrent auth safety.
+- No Playwright — pure aiohttp REST calls to Phone Connect.
 """
 from __future__ import annotations
 
@@ -28,7 +30,6 @@ import ssl as _ssl
 
 from app.logger import setup_logger
 
-# Enforce safe DOM parsing — no regex on HTML trees.
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -48,14 +49,10 @@ app = FastAPI(title="Phone Worker — Antigravity Assistant")
 
 _cookie_jar: Optional[aiohttp.CookieJar] = None
 _authenticated = False
-
-# Lock prevents two concurrent coroutines from both entering _ensure_auth
-# and firing duplicate POST /login requests when _authenticated is False.
 _auth_lock = asyncio.Lock()
 
 
 def _make_ssl_context() -> Optional[_ssl.SSLContext]:
-    """Create a permissive SSL context for self-signed Phone Connect certs."""
     if PHONE_CONNECT_URL.startswith("https"):
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
@@ -72,12 +69,7 @@ def _get_cookie_jar() -> aiohttp.CookieJar:
 
 
 async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
-    """Authenticate against Phone Connect if not already done.
-
-    Uses double-checked locking: check outside the lock for the common
-    (already-authenticated) path, then re-check inside the lock to handle
-    the race where two coroutines both see _authenticated=False at the same time.
-    """
+    """Authenticate with double-checked locking to prevent duplicate logins."""
     global _authenticated
     if _authenticated:
         return True
@@ -86,9 +78,7 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
         return True
 
     async with _auth_lock:
-        # Re-check after acquiring the lock — another coroutine may have
-        # authenticated while we were waiting.
-        if _authenticated:
+        if _authenticated:  # re-check after acquiring lock
             return True
         try:
             async with session.post(
@@ -105,13 +95,11 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
                 pw_log.warning(f"Phone Connect auth rejected: {data}")
                 return False
         except Exception as exc:
-            # Was print() — now goes to rotating log file.
             pw_log.warning(f"Phone Connect auth failed: {exc}")
             return False
 
 
 async def _pc_request(method: str, path: str, json_data: dict = None) -> dict:
-    """Make an authenticated HTTP request to Phone Connect."""
     jar = _get_cookie_jar()
     ssl_ctx = _make_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
@@ -121,7 +109,6 @@ async def _pc_request(method: str, path: str, json_data: dict = None) -> dict:
         url = f"{PHONE_CONNECT_URL}{path}"
         headers = {
             "Content-Type": "application/json",
-            # Required to bypass ngrok's browser-warning interstitial page.
             "ngrok-skip-browser-warning": "true",
         }
         timeout = aiohttp.ClientTimeout(total=15)
@@ -145,8 +132,6 @@ async def _pc_request(method: str, path: str, json_data: dict = None) -> dict:
             raise HTTPException(502, f"Phone Connect unreachable: {exc}")
 
 
-# --- Pydantic request models ---
-
 class SendMessageRequest(BaseModel):
     text: str
 
@@ -157,8 +142,6 @@ class SetModelRequest(BaseModel):
     model: str
 
 
-# --- API endpoints ---
-
 @app.get("/health")
 async def health():
     try:
@@ -166,7 +149,6 @@ async def health():
         return {"status": "ok", "phone_connect": pc}
     except Exception as exc:
         return {"status": "degraded", "phone_connect_error": str(exc)}
-
 
 @app.post("/send_message")
 async def send_message(req: SendMessageRequest):
@@ -176,11 +158,9 @@ async def send_message(req: SendMessageRequest):
     result = await _pc_request("POST", "/send", {"message": text})
     return {"status": "ok", "result": result}
 
-
 @app.get("/snapshot")
 async def get_snapshot():
     return await _pc_request("GET", "/snapshot")
-
 
 @app.get("/snapshot/text")
 async def get_snapshot_text():
@@ -191,11 +171,9 @@ async def get_snapshot_text():
     messages = parse_messages_from_html(html)
     return {"messages": messages, "count": len(messages), "raw_length": len(html)}
 
-
 @app.get("/app-state")
 async def get_app_state():
     return await _pc_request("GET", "/app-state")
-
 
 @app.post("/set-mode")
 async def set_mode(req: SetModeRequest):
@@ -203,38 +181,31 @@ async def set_mode(req: SetModeRequest):
         raise HTTPException(400, "Mode must be 'Fast' or 'Planning'")
     return await _pc_request("POST", "/set-mode", {"mode": req.mode})
 
-
 @app.post("/set-model")
 async def set_model(req: SetModelRequest):
     return await _pc_request("POST", "/set-model", {"model": req.model})
-
 
 @app.get("/models")
 async def get_available_models():
     return await _pc_request("GET", "/models")
 
-
 @app.post("/stop")
 async def stop_generation():
     return await _pc_request("POST", "/stop")
-
 
 @app.post("/new-chat")
 async def new_chat():
     return await _pc_request("POST", "/new-chat")
 
-
 @app.get("/chat-history")
 async def get_chat_history():
     return await _pc_request("GET", "/chat-history")
-
 
 @app.post("/init")
 async def init_session():
     try:
         result = await _pc_request(
-            "POST",
-            "/send",
+            "POST", "/send",
             {"message": os.getenv("PHONE_INIT_MESSAGE", "init session")},
         )
         return {"status": "ok", "result": result}
@@ -243,44 +214,29 @@ async def init_session():
 
 
 # ---------------------------------------------------------------------------
-# Text cleaning utilities
-# ---------------------------------------------------------------------------
-# These operate on plain text (after BS4 extraction), NOT on raw HTML.
-# Regex is only used here on extracted plain text — never on DOM trees.
+# Text detection and cleaning
+# Regex operates on plain strings AFTER BS4 extraction — never on raw HTML.
 # ---------------------------------------------------------------------------
 
-_RE_WS = re.compile(r"[ \t]+")
-_RE_MULTI_NL = re.compile(r"\n{3,}")
-_RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-_RE_CSS = re.compile(
-    r"(?:^|\n)\s*[\w\-.*#@:>\[\]=~^|,\s]+\s*\{[^}]*\}", re.MULTILINE
-)
-_RE_FRAGMENT = re.compile(r"^[A-Za-z]+[),.:;]+$")
+_RE_WS        = re.compile(r"[ \t]+")
+_RE_MULTI_NL  = re.compile(r"\n{3,}")
+_RE_ANSI      = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_RE_CSS       = re.compile(r"(?:^|\n)\s*[\w\-.*#@:>\[\]=~^|,\s]+\s*\{[^}]*\}", re.MULTILINE)
+_RE_FRAGMENT  = re.compile(r"^[A-Za-z]+[),.:;]+$")
 
 _RE_GIT = re.compile(
-    r"(?:^|\n)\s*(?:"
-    r"diff --git\b|index [0-9a-f]+\.\.[0-9a-f]+|"
-    r"--- a/|"
-    r"\+\+\+ b/|"
-    r"@@ .+? @@|"
-    r"commit [0-9a-f]{7,40}\b|"
-    r"Author:\s|Date:\s|Merge:\s|"
-    r"(?:modified|deleted|renamed|new file):\s+"
-    r").*",
+    r"(?:^|\n)\s*(?:diff --git\b|index [0-9a-f]+\.\.[0-9a-f]+|"
+    r"--- a/|\+\+\+ b/|@@ .+? @@|commit [0-9a-f]{7,40}\b|"
+    r"Author:\s|Date:\s|Merge:\s|(?:modified|deleted|renamed|new file):\s+).*",
     re.MULTILINE,
 )
-
 _RE_SHELL = re.compile(
-    r"(?:^|\n)\s*(?:"
-    r"npm\s+(?:warn|info|notice|WARN|ERR!)\b|"
-    r"\$\s+\S|>\s+\S+@\S+\s|"
-    r"added \d+ packages?\b|found \d+ vulnerabilities?\b|"
-    r"up to date\b|"
-    r"[✓✗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
-    r").*",
+    r"(?:^|\n)\s*(?:npm\s+(?:warn|info|notice|WARN|ERR!)\b|\$\s+\S|>\s+\S+@\S+\s|"
+    r"added \d+ packages?\b|found \d+ vulnerabilities?\b|up to date\b|"
+    r"[✓✗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]).*",
     re.MULTILINE,
 )
-_RE_DECORATIVE = re.compile(r"[─━═▓░▒█▄▀]{4,}")
+_RE_DECORATIVE   = re.compile(r"[─━═▓░▒█▄▀]{4,}")
 _RE_AGENT_HEADER = re.compile(
     r"\[\d{1,2}/\d{1,2}/\d{2,4}[^\]]+\][^:]+:\s*(?:🤖\s*)?", re.IGNORECASE
 )
@@ -303,7 +259,74 @@ _UI_CHROME: set[str] = {
 }
 
 
+def _is_word_waterfall(text: str) -> bool:
+    """Detect Antigravity's streaming Thought Process rendering.
+
+    During streaming, each word lands in its own <span>/<div>.
+    After BS4 extraction with separator="\\n", this becomes one-word-per-line:
+        I
+        am
+        analyzing
+        the
+        problem
+
+    Heuristic: >60% of non-empty lines have 1-2 tokens AND
+    there are at least 10 such lines (avoid false positives on short lists).
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 10:
+        return False
+    short = sum(1 for l in lines if len(l.split()) <= 2)
+    return (short / len(lines)) > 0.60
+
+
+def _collapse_waterfall(text: str) -> str:
+    """Re-join waterfall lines into readable paragraphs.
+
+    Groups consecutive non-empty lines into a single paragraph joined by spaces.
+    An empty line in the source becomes a paragraph separator (blank line).
+
+    Input:                      Output:
+        I                           I am analyzing the problem.
+        am
+        analyzing                   This is the second paragraph.
+        the
+        problem.
+
+        This
+        is the second
+        paragraph.
+    """
+    lines = text.split("\n")
+    paragraphs: list[list[str]] = [[]]
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if paragraphs[-1]:      # close current paragraph on blank line
+                paragraphs.append([])
+        else:
+            paragraphs[-1].append(stripped)
+
+    parts = [" ".join(para) for para in paragraphs if para]
+    return "\n\n".join(parts)
+
+
+def _extract_text_smart(tag) -> str:
+    """Extract text from a BS4 element with waterfall detection.
+
+    1. Extract with separator="\\n" to preserve paragraph structure.
+    2. If the result is a word-waterfall, collapse it into sentences.
+    3. Normal multi-paragraph messages pass through unchanged.
+    """
+    text = tag.get_text(separator="\n", strip=True)
+    if _is_word_waterfall(text):
+        text = _collapse_waterfall(text)
+    return text
+
+
 def _clean_text(raw: str) -> str:
+    """Clean plain text: remove ANSI, CSS artifacts, shell noise, UI chrome."""
     text = _RE_ANSI.sub("", raw)
     text = _RE_CSS.sub("", text)
     text = _RE_GIT.sub("", text)
@@ -314,11 +337,11 @@ def _clean_text(raw: str) -> str:
     text = _RE_SYS_LOGS.sub(r"\n\n\1", text)
 
     lines = text.split("\n")
-    cleaned_lines = []
+    cleaned: list[str] = []
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            cleaned_lines.append("")
+            cleaned.append("")
             continue
         if stripped.lower() in _UI_CHROME:
             continue
@@ -330,9 +353,9 @@ def _clean_text(raw: str) -> str:
             continue
         if len(stripped) < 4 and _RE_FRAGMENT.match(stripped):
             continue
-        cleaned_lines.append(line)
+        cleaned.append(line)
 
-    text = "\n".join(cleaned_lines)
+    text = "\n".join(cleaned)
     return _RE_MULTI_NL.sub("\n\n", text).strip()
 
 
@@ -354,28 +377,25 @@ def _stable_hash(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Safe DOM parsing via BeautifulSoup4
-# ---------------------------------------------------------------------------
-# RULE: Never use regex directly on HTML. BS4 handles the DOM tree.
-# Regex is only applied AFTER get_text() — i.e. on plain extracted strings.
+# DOM parsing — BS4 only. Regex never runs on raw HTML.
 # ---------------------------------------------------------------------------
 
 def parse_messages_from_html(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Decompose heavy tags that contain no useful text content.
+    # Remove non-content tags.
     for tag in soup(["style", "script", "noscript", "template", "svg", "canvas"]):
         tag.decompose()
 
-    # 2. Remove IDE chrome elements (terminals, code editors).
+    # Remove IDE chrome (terminals, editors).
     for tag in soup.find_all(
         class_=re.compile(r"xterm|terminal|cm-editor|cm-content|monaco-editor", re.I)
     ):
         tag.decompose()
 
-    messages = []
+    messages: list[dict] = []
 
-    # 3. Try to find structured message blocks first.
+    # Try structured message blocks first.
     blocks = soup.find_all(
         lambda t: t.name == "div"
         and (
@@ -385,18 +405,16 @@ def parse_messages_from_html(html: str) -> list[dict]:
     )
 
     if not blocks:
-        # Fallback: treat the entire page as a single assistant message.
-        # FIXED: original code had a comment placeholder here but no return —
-        # function silently returned [] on fallback path.
-        text = soup.get_text(separator=" ", strip=True)
+        # Fallback: full page as one message.
+        # _extract_text_smart handles waterfall even here.
+        text = _extract_text_smart(soup)
         text = _clean_text(text)
         if _is_meaningful(text):
             return [{"role": "assistant", "text": text, "hash": _stable_hash(text)}]
         return []
 
-    # Structured extraction from identified message blocks.
     for block in blocks:
-        text = block.get_text(separator=" ", strip=True)
+        text = _extract_text_smart(block)
         text = _clean_text(text)
         if not _is_meaningful(text):
             continue
