@@ -1,10 +1,3 @@
-"""
-phone_worker.py — FastAPI gateway to Phone Connect REST API.
-
-CHANGES vs previous version:
-- Fixed Pyright strict typing errors (Optional[dict], aiohttp **kwargs typing).
-- Added safe HTML class attribute extractor (_get_classes) to fix OptionalIterable errors.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +5,7 @@ import os
 import re
 import hashlib
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, cast
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -23,9 +16,9 @@ import ssl as _ssl
 from app.logger import setup_logger
 
 try:
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Tag
 except ImportError:
-    raise RuntimeError("BeautifulSoup is missing. Run: pip install beautifulsoup4")
+    raise RuntimeError("BeautifulSoup is missing. Run: pip install beautifulsoup4 lxml")
 
 BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -79,7 +72,7 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 data = await resp.json()
-                if data.get("success"):
+                if isinstance(data, dict) and data.get("success"):
                     _authenticated = True
                     pw_log.info("Authenticated against Phone Connect.")
                     return True
@@ -90,7 +83,7 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
             return False
 
 
-async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]] = None) -> dict:
+async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     jar = _get_cookie_jar()
     ssl_ctx = _make_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
@@ -105,21 +98,22 @@ async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]
         timeout = aiohttp.ClientTimeout(total=15)
 
         try:
-            # Explicitly pass arguments to avoid Pyright dict unpacking type errors
             if method == "GET":
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
                     if resp.status == 401:
                         global _authenticated
                         _authenticated = False
                         raise HTTPException(502, "Phone Connect authentication lost")
-                    return await resp.json()
+                    res = await resp.json()
+                    return cast(dict[str, Any], res)
             else:
                 payload = json_data if json_data is not None else {}
                 async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                     if resp.status == 401:
                         _authenticated = False
                         raise HTTPException(502, "Phone Connect authentication lost")
-                    return await resp.json()
+                    res = await resp.json()
+                    return cast(dict[str, Any], res)
         except aiohttp.ClientError as exc:
             raise HTTPException(502, f"Phone Connect unreachable: {exc}")
 
@@ -182,7 +176,7 @@ async def get_snapshot_hash_fast():
 @app.get("/snapshot/text")
 async def get_snapshot_text():
     raw = await _pc_request("GET", "/snapshot")
-    html = raw.get("html", "")
+    html = str(raw.get("html", ""))
     if not html:
         return {"messages": [], "raw_length": 0}
     messages = parse_messages_from_html(html)
@@ -300,7 +294,7 @@ def _collapse_waterfall(text: str) -> str:
 
 
 def _extract_text_smart(tag: Any) -> str:
-    text = tag.get_text(separator="\n", strip=True)
+    text = str(tag.get_text(separator="\n", strip=True))
     if _is_word_waterfall(text):
         text = _collapse_waterfall(text)
     return text
@@ -356,12 +350,7 @@ def _stable_hash(text: str) -> str:
     return hashlib.md5(prefix.encode()).hexdigest()[:8]
 
 
-# ---------------------------------------------------------------------------
-# DOM parsing
-# ---------------------------------------------------------------------------
-
 def _safe_get_classes(tag: Any) -> list[str]:
-    """Safe extraction of class attribute to satisfy Pyright typing."""
     cls_attr = tag.get("class")
     if isinstance(cls_attr, list):
         return [str(c) for c in cls_attr]
@@ -370,7 +359,11 @@ def _safe_get_classes(tag: Any) -> list[str]:
     return []
 
 
-def parse_messages_from_html(html: str) -> list[dict]:
+# ---------------------------------------------------------------------------
+# DOM parsing
+# ---------------------------------------------------------------------------
+
+def parse_messages_from_html(html: str) -> list[dict[str, str]]:
     soup = BeautifulSoup(html, "lxml")
 
     for tag in soup(["style", "script", "noscript", "template", "svg", "canvas"]):
@@ -381,7 +374,7 @@ def parse_messages_from_html(html: str) -> list[dict]:
     ):
         tag.decompose()
 
-    messages: list[dict] = []
+    messages: list[dict[str, str]] = []
 
     blocks = soup.find_all(
         lambda t: t.name == "div"
@@ -394,7 +387,7 @@ def parse_messages_from_html(html: str) -> list[dict]:
     if not blocks:
         text = _extract_text_smart(soup)
         if len(text) > 15000:
-            text = text[:15000] + "\n\n...[TRUNCATED FOR MEMORY SAFETY]..."
+            text = text[:15000] + "\n\n...[TRUNCATED]..."
         text = _clean_text(text)
         if _is_meaningful(text):
             return [{"role": "assistant", "text": text, "hash": _stable_hash(text)}]
@@ -402,9 +395,8 @@ def parse_messages_from_html(html: str) -> list[dict]:
 
     for block in blocks:
         text = _extract_text_smart(block)
-        
         if len(text) > 15000:
-            text = text[:15000] + "\n\n...[TRUNCATED FOR MEMORY SAFETY]..."
+            text = text[:15000] + "\n\n...[TRUNCATED]..."
             
         text = _clean_text(text)
         if not _is_meaningful(text):
