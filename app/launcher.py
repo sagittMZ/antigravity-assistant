@@ -1,20 +1,5 @@
 """
 launcher.py — Unified launcher for all Antigravity Assistant services.
-
-CHANGES vs previous version:
-- Replaced find_and_kill_extra_antigravity() with kill_all_antigravity().
-  Old version only killed "extra" instances (kept first). New version kills
-  ALL antigravity processes before starting — prevents accumulation across
-  systemd restarts.
-- Added kill_orphan_phone_connect() — kills stale Node.js processes bound
-  to port 3000 before Phone Connect starts. Prevents "port already in use"
-  after crash without proper cleanup.
-- Added _cleanup_all() — called both at startup AND on shutdown (KeyboardInterrupt
-  and SIGTERM). Ensures clean state on every lifecycle event.
-- Registered SIGTERM handler so systemd stop/restart triggers full cleanup,
-  not just KeyboardInterrupt path.
-- _wait_for_port() replaces time.sleep(3) — active polling until port is ready.
-- All other logic (os.killpg, start_new_session, MAX_RESTARTS) unchanged.
 """
 from __future__ import annotations
 
@@ -87,16 +72,10 @@ HEALTH_CHECK_INTERVAL = 30
 MAX_RESTARTS = 5
 
 # How long to wait for a port after service start.
-# Node.js (Phone Connect) cold start can take 10-15s on ThinkPad E580.
 PORT_WAIT_TIMEOUT = 45
 
 
-# ---------------------------------------------------------------------------
-# Process cleanup — the core fix for the "20 antigravity processes" problem
-# ---------------------------------------------------------------------------
-
 def _pkill(pattern: str, signal_num: int = signal.SIGTERM, wait: float = 2.0) -> int:
-    """Kill all processes matching pattern. Returns number of PIDs killed."""
     try:
         result = subprocess.run(
             ["pgrep", "-f", pattern],
@@ -119,37 +98,24 @@ def _pkill(pattern: str, signal_num: int = signal.SIGTERM, wait: float = 2.0) ->
 
 
 def kill_all_antigravity() -> None:
-    """Kill ALL antigravity processes unconditionally.
-
-    Why unconditional (not "keep first")?
-    After a systemd restart the "first" process may be a zombie or may have
-    lost its CDP connection. Starting fresh is always safer than trying to
-    reuse a stale process. Electron (antigravity) starts in ~3s on this hw.
-
-    Two-pass strategy:
-    1. SIGTERM — graceful shutdown, lets Electron flush its state.
-    2. Wait 3s, then SIGKILL anything that survived.
     """
-    count = _pkill("antigravity", signal.SIGTERM, wait=3.0)
+    Kill ALL antigravity processes safely.
+    Matches specifically the IDE launch command to avoid killing the bot 
+    or Phone Connect just because they run from a folder named 'antigravity'.
+    """
+    target_pattern = "antigravity --remote-debugging-port"
+    count = _pkill(target_pattern, signal.SIGTERM, wait=3.0)
     if count > 0:
-        logger.info(f"Sent SIGTERM to {count} antigravity process(es).")
-        # Second pass: kill survivors that ignored SIGTERM
-        survivors = _pkill("antigravity", signal.SIGKILL, wait=1.0)
+        logger.info(f"Sent SIGTERM to {count} antigravity IDE process(es).")
+        survivors = _pkill(target_pattern, signal.SIGKILL, wait=1.0)
         if survivors:
-            logger.warning(f"SIGKILL sent to {survivors} surviving antigravity process(es).")
+            logger.warning(f"SIGKILL sent to {survivors} surviving antigravity IDE process(es).")
     else:
-        logger.info("No antigravity processes found — clean state.")
+        logger.info("No antigravity IDE processes found — clean state.")
 
 
 def kill_orphan_phone_connect() -> None:
-    """Kill any stale Node.js process holding port 3000.
-
-    After a crash without proper cleanup, the old Phone Connect process may
-    still be alive (or in zombie state) holding the port. New instance can't
-    bind and silently fails.
-    """
     try:
-        # fuser -k sends SIGKILL to whatever owns the port
         result = subprocess.run(
             ["fuser", "-k", "3000/tcp"],
             capture_output=True, text=True
@@ -158,32 +124,21 @@ def kill_orphan_phone_connect() -> None:
             logger.info("Killed stale process on port 3000 (Phone Connect).")
             time.sleep(1.0)
     except FileNotFoundError:
-        # fuser not available — fallback to pkill
+        # Fallback specifically to phone_chat to avoid killing the python bot
         _pkill("antigravity_phone_chat", signal.SIGTERM, wait=1.0)
     except Exception as e:
         logger.error(f"kill_orphan_phone_connect failed: {e}")
 
 
 def _cleanup_all(services: list["Service"]) -> None:
-    """Stop all managed services and clean up stale processes.
-
-    Called both at shutdown (KeyboardInterrupt / SIGTERM) and at startup
-    (before launching fresh instances). Ensures no accumulation of stale
-    processes across restarts.
-    """
     logger.info("Running full cleanup...")
     for svc in reversed(services):
         svc.stop()
-    # Belt-and-suspenders: kill anything that escaped our process groups.
     if LAUNCH_ANTIGRAVITY:
         kill_all_antigravity()
     kill_orphan_phone_connect()
     logger.info("Cleanup complete.")
 
-
-# ---------------------------------------------------------------------------
-# Service management
-# ---------------------------------------------------------------------------
 
 class Service:
     def __init__(
@@ -223,8 +178,6 @@ class Service:
         logger.info(f"Starting {self.name}: {' '.join(str(c) for c in self.cmd)}")
         self.log_file = open(log_path, "w", encoding="utf-8")
 
-        # start_new_session=True: child gets its own process group.
-        # os.killpg can then kill the entire subtree with one signal.
         self.proc = subprocess.Popen(
             [str(c) for c in self.cmd],
             cwd=self.cwd,
@@ -258,7 +211,7 @@ class Service:
                 except Exception:
                     pass
             except ProcessLookupError:
-                pass  # already gone
+                pass 
             except Exception as e:
                 logger.error(f"Error stopping {self.name}: {e}")
         if self.log_file:
@@ -277,8 +230,6 @@ class Service:
             f"Restarting {self.name} (attempt {self.restart_count}/{MAX_RESTARTS})..."
         )
         self.stop()
-        # For Antigravity specifically — kill all before restart to prevent
-        # accumulation. Other services just stop their own process.
         if self.name == "Antigravity" and LAUNCH_ANTIGRAVITY:
             kill_all_antigravity()
         time.sleep(2)
@@ -297,7 +248,6 @@ def is_port_in_use(host: str, port: int) -> bool:
 
 
 def _wait_for_port(host: str, port: int, timeout: int = PORT_WAIT_TIMEOUT) -> None:
-    """Active polling until port accepts connections or timeout expires."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if is_port_in_use(host, port):
@@ -317,18 +267,11 @@ def http_get_ok(url: str, timeout: float = 5.0) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     antigravity_project_dir = resolve_active_project()
     logger.info("=== Antigravity Assistant launcher starting ===")
     logger.info(f"Active project: {antigravity_project_dir}")
 
-    # --- Pre-launch cleanup ---
-    # Kill ALL stale antigravity processes before starting fresh.
-    # This is the primary fix for the "20 antigravity processes" accumulation.
     if LAUNCH_ANTIGRAVITY:
         kill_all_antigravity()
     kill_orphan_phone_connect()
@@ -342,8 +285,8 @@ def main() -> None:
                     name="Antigravity",
                     cmd=[
                         "antigravity",
-                        ".",
                         f"--remote-debugging-port={ANTIGRAVITY_DEBUG_PORT}",
+                        ".",
                     ],
                     cwd=antigravity_project_dir,
                     check_port=ANTIGRAVITY_DEBUG_PORT,
@@ -398,9 +341,6 @@ def main() -> None:
         )
     )
 
-    # Register SIGTERM handler so systemd stop/restart triggers proper cleanup.
-    # Without this, systemd sends SIGTERM to the launcher but child processes
-    # (especially Antigravity/Electron) keep running until the OS kills them.
     def _sigterm_handler(signum, frame):
         logger.info("SIGTERM received — shutting down cleanly.")
         _cleanup_all(services)
@@ -408,7 +348,6 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    # Start services sequentially — each waits for its port before next starts.
     for svc in services:
         svc.start()
 
@@ -430,7 +369,6 @@ def main() -> None:
         else:
             logger.warning("phone_worker /health failed — skipping auto-init.")
 
-    # Health-check loop.
     try:
         while True:
             time.sleep(HEALTH_CHECK_INTERVAL)
