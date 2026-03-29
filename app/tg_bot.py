@@ -3,16 +3,8 @@ tg_bot.py — Telegram bot for full bidirectional communication
 with Antigravity AI agent via Phone Connect.
 
 CHANGES vs original:
-- _bg_baseline_hashes is now persisted to SQLite (app.state) on every update
-  and restored on startup. Prevents duplicate message flood after systemd
-  restart on network drop (critical for unstable connections).
-- write_log() replaced with tg_log (RotatingFileHandler via app.logger).
-  The agent.log file is still written separately for the user-facing log
-  view, but internal errors/warnings now go through the proper logger.
-- init_db() called at module level to ensure the DB is ready before any
-  async handler runs.
-- All other features (background_watcher, poll_for_response, projects,
-  mode/model switching, artifacts) unchanged.
+- Fixed Pyright OptionalMemberAccess errors for message.text and callback.data
+  by adding explicit Type Guards (if not x: return).
 """
 from __future__ import annotations
 
@@ -23,7 +15,7 @@ import time
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
@@ -40,7 +32,6 @@ from app.state import init_db, get_val, set_val
 BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-# Initialize SQLite DB before any handler runs.
 init_db()
 
 tg_log = setup_logger("tg_bot", "tg_bot.log")
@@ -62,8 +53,6 @@ if not ALLOWED_USER_ID:
 SESSION_FILE = BASE_DIR / "session.json"
 PROJECTS_FILE = BASE_DIR / "projects.json"
 
-# agent.log is the user-facing log shown via the Logs button.
-# Internal errors go to tg_bot.log via tg_log.
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "agent.log"
@@ -92,26 +81,18 @@ _waiting_for_response = False
 _bg_watcher_running = False
 _bg_last_hash: Optional[str] = None
 
-# Restored from SQLite on startup — survives systemd restarts.
-# Without persistence: every restart floods the user with duplicate messages
-# from the agent's last session (especially painful on unstable connections).
 _bg_baseline_hashes: set[str] = set(get_val("bg_baseline_hashes", []))
 
 _active_chat_id: Optional[int] = None
 
 
 def _persist_baseline() -> None:
-    """Write current baseline hashes to SQLite so they survive restarts."""
     set_val("bg_baseline_hashes", list(_bg_baseline_hashes))
 
 
 class AddProjectStates(StatesGroup):
     waiting_for_name = State()
 
-
-# ---------------------------------------------------------------------------
-# Session helpers
-# ---------------------------------------------------------------------------
 
 def load_session() -> dict:
     if SESSION_FILE.exists():
@@ -128,10 +109,6 @@ def save_session(session_data: dict) -> None:
     with open(SESSION_FILE, "w", encoding="utf-8") as f:
         json.dump(session_data, f, ensure_ascii=False, indent=2)
 
-
-# ---------------------------------------------------------------------------
-# Project management
-# ---------------------------------------------------------------------------
 
 def load_projects() -> list[dict]:
     if PROJECTS_FILE.exists():
@@ -215,24 +192,11 @@ def remove_project(name: str) -> bool:
 current_session = load_session()
 
 
-# ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
-
 def write_log(sender: str, message: str) -> None:
-    """Append a line to the user-facing agent.log (shown via Logs button).
-
-    Errors and warnings also go to tg_bot.log via tg_log for
-    RotatingFileHandler-based management.
-    """
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         timestamp = datetime.now().strftime("%H:%M:%S")
         f.write(f"[{timestamp}] {sender}: {message}\n")
 
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
 
 async def pw_get(path: str) -> dict:
     async with aiohttp.ClientSession() as session:
@@ -243,11 +207,12 @@ async def pw_get(path: str) -> dict:
             return await resp.json()
 
 
-async def pw_post(path: str, data: dict = None) -> dict:
+async def pw_post(path: str, data: Optional[dict[str, Any]] = None) -> dict:
+    payload = data if data is not None else {}
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{PHONE_WORKER_URL}{path}",
-            json=data or {},
+            json=payload,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             return await resp.json()
@@ -262,10 +227,6 @@ async def fm_get(path: str) -> str:
                 return text
             raise RuntimeError(f"HTTP {resp.status}: {text}")
 
-
-# ---------------------------------------------------------------------------
-# System control
-# ---------------------------------------------------------------------------
 
 async def restart_service() -> tuple[bool, str]:
     try:
@@ -286,10 +247,6 @@ async def restart_service() -> tuple[bool, str]:
     except Exception as e:
         return False, f"Restart error: {e}"
 
-
-# ---------------------------------------------------------------------------
-# Deduplication helpers
-# ---------------------------------------------------------------------------
 
 _sent_text_prefixes: dict[str, str] = {}
 
@@ -323,10 +280,6 @@ def _reset_sent_texts() -> None:
     _sent_text_prefixes.clear()
 
 
-# ---------------------------------------------------------------------------
-# Snapshot helpers
-# ---------------------------------------------------------------------------
-
 async def get_current_messages() -> list[dict]:
     try:
         data = await pw_get("/snapshot/text")
@@ -338,20 +291,17 @@ async def get_current_messages() -> list[dict]:
 
 async def get_snapshot_hash() -> Optional[str]:
     try:
-        data = await pw_get("/snapshot")
-        html = data.get("html", "")
-        if html:
-            return hashlib.md5(html.encode()).hexdigest()
+        data = await pw_get("/snapshot/hash")
+        hash_val = data.get("hash", "")
+        if hash_val:
+            return hash_val
     except Exception:
         pass
     return None
 
 
-# ---------------------------------------------------------------------------
-# Polling (active wait after user sends a prompt)
-# ---------------------------------------------------------------------------
-
-async def poll_for_response(chat_id: int, timeout: float = None) -> None:
+# Стало:
+async def poll_for_response(chat_id: int, timeout: Optional[float] = None) -> None:
     global _polling_active, _last_snapshot_hash, _waiting_for_response
     global _bg_last_hash, _bg_baseline_hashes
 
@@ -404,7 +354,6 @@ async def poll_for_response(chat_id: int, timeout: float = None) -> None:
                 write_log("AI_RESPONSE", text[:200])
                 ever_sent = True
 
-        # Final sweep after stable period ends.
         try:
             final_msgs = await get_current_messages()
             for msg in final_msgs:
@@ -433,17 +382,10 @@ async def poll_for_response(chat_id: int, timeout: float = None) -> None:
     finally:
         _polling_active = False
         _waiting_for_response = False
-        # Hand off the final baseline to the background watcher so it
-        # doesn't re-send messages that were already delivered during polling.
         _bg_last_hash = prev_hash
         _bg_baseline_hashes = baseline_hashes
-        # Persist so the next restart doesn't re-send these messages.
         _persist_baseline()
 
-
-# ---------------------------------------------------------------------------
-# Message sending helpers
-# ---------------------------------------------------------------------------
 
 async def send_long_message(chat_id: int, text: str, **kwargs) -> None:
     MAX_LEN = 4000
@@ -468,10 +410,6 @@ async def send_long_message(chat_id: int, text: str, **kwargs) -> None:
             await asyncio.sleep(0.3)
         await bot.send_message(chat_id, part, **kwargs)
 
-
-# ---------------------------------------------------------------------------
-# Background watcher (passive — detects agent activity on desktop)
-# ---------------------------------------------------------------------------
 
 async def background_watcher() -> None:
     global _bg_watcher_running, _bg_last_hash, _bg_baseline_hashes
@@ -523,7 +461,6 @@ async def background_watcher() -> None:
                 except Exception as e:
                     tg_log.error(f"BG send error: {e}")
 
-            # Persist updated baseline after background delivery.
             _persist_baseline()
 
     except asyncio.CancelledError:
@@ -533,10 +470,6 @@ async def background_watcher() -> None:
     finally:
         _bg_watcher_running = False
 
-
-# ---------------------------------------------------------------------------
-# Keyboard builders
-# ---------------------------------------------------------------------------
 
 def get_main_menu():
     builder = ReplyKeyboardBuilder()
@@ -636,13 +569,9 @@ def is_allowed(user_id: int) -> bool:
     return user_id == ALLOWED_USER_ID
 
 
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     global _active_chat_id
     _active_chat_id = message.chat.id
@@ -670,14 +599,14 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await show_status(message)
 
 
 @dp.message(F.text == "Status")
 async def btn_status(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await show_status(message)
 
@@ -728,7 +657,7 @@ async def show_status(message: types.Message):
 
 @dp.message(F.text == "Refresh")
 async def btn_refresh(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     global _bg_baseline_hashes, _bg_last_hash, _active_chat_id
     _active_chat_id = message.chat.id
@@ -764,7 +693,6 @@ async def btn_refresh(message: types.Message):
             _mark_sent(text)
             sent_count += 1
 
-        # Persist after manual refresh too.
         _persist_baseline()
 
         if sent_count == 0:
@@ -779,7 +707,7 @@ async def btn_refresh(message: types.Message):
 
 @dp.message(F.text == "Prompt")
 async def btn_prompt(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await message.answer(
         "Send your next message — it will be routed directly to the Antigravity agent.",
@@ -789,7 +717,7 @@ async def btn_prompt(message: types.Message):
 
 @dp.message(F.text == "New Chat")
 async def btn_new_chat(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await bot.send_chat_action(message.chat.id, "typing")
     try:
@@ -802,7 +730,6 @@ async def btn_new_chat(message: types.Message):
             _bg_last_hash = None
             _bg_baseline_hashes.clear()
             _reset_sent_texts()
-            # Clear persisted baseline — new chat means fresh start.
             _persist_baseline()
             current_session["thread_id"] = str(int(time.time()))
             save_session(current_session)
@@ -821,7 +748,7 @@ async def btn_new_chat(message: types.Message):
 
 @dp.message(F.text == "Stop")
 async def btn_stop(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     try:
         await pw_post("/stop")
@@ -834,103 +761,113 @@ async def btn_stop(message: types.Message):
 
 @dp.message(F.text == "Mode/Model")
 async def btn_settings(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await message.answer("Settings Configuration:", reply_markup=get_settings_keyboard())
 
 
 @dp.callback_query(F.data == "settings_mode")
 async def cb_settings_mode(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    await callback.message.answer("Select the operation mode:", reply_markup=get_mode_keyboard())
+    if isinstance(callback.message, types.Message):
+        await callback.message.answer("Select the operation mode:", reply_markup=get_mode_keyboard())
     await callback.answer()
 
 
 @dp.callback_query(F.data == "settings_model")
 async def cb_settings_model(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    await callback.message.answer("Loading available models...", reply_markup=get_main_menu())
-    keyboard = await get_model_keyboard()
-    await callback.message.answer("Select the target model:", reply_markup=keyboard)
+    if isinstance(callback.message, types.Message):
+        await callback.message.answer("Loading available models...", reply_markup=get_main_menu())
+        keyboard = await get_model_keyboard()
+        await callback.message.answer("Select the target model:", reply_markup=keyboard)
     await callback.answer()
 
 
 @dp.callback_query(F.data == "models_refresh")
 async def cb_models_refresh(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
     _model_cache["fetched_at"] = 0
-    await callback.message.answer("Refreshing model list...", reply_markup=get_main_menu())
-    keyboard = await get_model_keyboard()
-    await callback.message.answer("Select the target model:", reply_markup=keyboard)
+    if isinstance(callback.message, types.Message):
+        await callback.message.answer("Refreshing model list...", reply_markup=get_main_menu())
+        keyboard = await get_model_keyboard()
+        await callback.message.answer("Select the target model:", reply_markup=keyboard)
     await callback.answer()
 
 
 @dp.callback_query(F.data == "settings_state")
 async def cb_settings_state(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    try:
-        state = await pw_get("/app-state")
-        await callback.message.answer(
-            f"Current Mode: {state.get('mode', 'Unknown')}\n"
-            f"Current Model: {state.get('model', 'Unknown')}"
-        )
-    except Exception as e:
-        await callback.message.answer(f"Error retrieving state: {e}")
+    if isinstance(callback.message, types.Message):
+        try:
+            state = await pw_get("/app-state")
+            await callback.message.answer(
+                f"Current Mode: {state.get('mode', 'Unknown')}\n"
+                f"Current Model: {state.get('model', 'Unknown')}"
+            )
+        except Exception as e:
+            await callback.message.answer(f"Error retrieving state: {e}")
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("mode_"))
 async def cb_set_mode(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
+        return
+    if not callback.data:
         return
     mode = callback.data.replace("mode_", "")
-    try:
-        result = await pw_post("/set-mode", {"mode": mode})
-        if result.get("success") or result.get("alreadySet"):
+    if isinstance(callback.message, types.Message):
+        try:
+            result = await pw_post("/set-mode", {"mode": mode})
+            if result.get("success") or result.get("alreadySet"):
+                await callback.message.answer(
+                    f"Operation mode updated to: {mode}", reply_markup=get_main_menu()
+                )
+            else:
+                await callback.message.answer(
+                    f"Error: {result.get('error', 'Unknown error')}", reply_markup=get_main_menu()
+                )
+        except Exception as e:
             await callback.message.answer(
-                f"Operation mode updated to: {mode}", reply_markup=get_main_menu()
+                f"Error executing request: {e}", reply_markup=get_main_menu()
             )
-        else:
-            await callback.message.answer(
-                f"Error: {result.get('error', 'Unknown error')}", reply_markup=get_main_menu()
-            )
-    except Exception as e:
-        await callback.message.answer(
-            f"Error executing request: {e}", reply_markup=get_main_menu()
-        )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("model_"))
 async def cb_set_model(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
+        return
+    if not callback.data:
         return
     model = callback.data.replace("model_", "")
-    try:
-        result = await pw_post("/set-model", {"model": model})
-        if result.get("success"):
+    if isinstance(callback.message, types.Message):
+        try:
+            result = await pw_post("/set-model", {"model": model})
+            if result.get("success"):
+                await callback.message.answer(
+                    f"Active model updated to: {model}", reply_markup=get_main_menu()
+                )
+            else:
+                await callback.message.answer(
+                    f"Error updating model: {result.get('error', 'Unknown error')}",
+                    reply_markup=get_main_menu(),
+                )
+        except Exception as e:
             await callback.message.answer(
-                f"Active model updated to: {model}", reply_markup=get_main_menu()
+                f"Error executing request: {e}", reply_markup=get_main_menu()
             )
-        else:
-            await callback.message.answer(
-                f"Error updating model: {result.get('error', 'Unknown error')}",
-                reply_markup=get_main_menu(),
-            )
-    except Exception as e:
-        await callback.message.answer(
-            f"Error executing request: {e}", reply_markup=get_main_menu()
-        )
     await callback.answer()
 
 
 @dp.message(F.text == "Projects")
 async def btn_projects(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     project = get_active_project()
     active_name = project["name"] if project else "none"
@@ -948,65 +885,72 @@ async def btn_projects(message: types.Message):
 
 @dp.callback_query(F.data.startswith("proj_select_"))
 async def cb_project_select(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
+        return
+    if not callback.data:
         return
     name = callback.data.replace("proj_select_", "")
     project = set_active_project(name)
-    if project:
-        await callback.message.edit_text(
-            f"Active project updated to: *{name}*\nPath: `{project['path']}`\n\n"
-            "Press Launch to restart.",
-            parse_mode="Markdown",
-            reply_markup=get_projects_keyboard(),
-        )
-    else:
-        await callback.message.answer(f"Project identifier not found: {name}")
+    if isinstance(callback.message, types.Message):
+        if project:
+            await callback.message.edit_text(
+                f"Active project updated to: *{name}*\nPath: `{project['path']}`\n\n"
+                "Press Launch to restart.",
+                parse_mode="Markdown",
+                reply_markup=get_projects_keyboard(),
+            )
+        else:
+            await callback.message.answer(f"Project identifier not found: {name}")
     await callback.answer()
 
 
 @dp.callback_query(F.data == "proj_launch")
 async def cb_project_launch(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    project = get_active_project()
-    if not project:
-        await callback.message.answer("No active project is currently selected.")
-        await callback.answer()
-        return
-    if not Path(project["path"]).exists():
+    if isinstance(callback.message, types.Message):
+        project = get_active_project()
+        if not project:
+            await callback.message.answer("No active project is currently selected.")
+            await callback.answer()
+            return
+        if not Path(project["path"]).exists():
+            await callback.message.answer(
+                f"The specified project directory does not exist:\n`{project['path']}`",
+                parse_mode="Markdown",
+            )
+            await callback.answer()
+            return
+        
         await callback.message.answer(
-            f"The specified project directory does not exist:\n`{project['path']}`",
-            parse_mode="Markdown",
-        )
-        await callback.answer()
-        return
-    await callback.message.answer(
-        f"Initiating Antigravity restart with workspace: *{project['name']}*...",
-        parse_mode="Markdown",
-        reply_markup=get_main_menu(),
-    )
-    await callback.answer()
-    write_log("PROJECT", f"Launching workspace: {project['name']} at {project['path']}")
-    ok, msg = await restart_service()
-    if not ok:
-        await callback.message.answer(
-            f"Service restart failed: {msg}\n\nManual restart required.",
+            f"Initiating Antigravity restart with workspace: *{project['name']}*...",
             parse_mode="Markdown",
             reply_markup=get_main_menu(),
         )
+        await callback.answer()
+        
+        write_log("PROJECT", f"Launching workspace: {project['name']} at {project['path']}")
+        ok, msg = await restart_service()
+        if not ok:
+            await callback.message.answer(
+                f"Service restart failed: {msg}\n\nManual restart required.",
+                parse_mode="Markdown",
+                reply_markup=get_main_menu(),
+            )
 
 
 @dp.callback_query(F.data == "proj_add")
 async def cb_project_add(callback: types.CallbackQuery, state: FSMContext):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    await callback.message.answer(
-        f"Enter the new project name (directory inside `{PROJECTS_BASE_DIR}`):\n\n"
-        "Type /cancel to abort.",
-        parse_mode="Markdown",
-        reply_markup=get_main_menu(),
-    )
-    await state.set_state(AddProjectStates.waiting_for_name)
+    if isinstance(callback.message, types.Message):
+        await callback.message.answer(
+            f"Enter the new project name (directory inside `{PROJECTS_BASE_DIR}`):\n\n"
+            "Type /cancel to abort.",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu(),
+        )
+        await state.set_state(AddProjectStates.waiting_for_name)
     await callback.answer()
 
 
@@ -1018,7 +962,9 @@ async def cancel_add_project(message: types.Message, state: FSMContext):
 
 @dp.message(AddProjectStates.waiting_for_name)
 async def process_new_project_name(message: types.Message, state: FSMContext):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+    if not message.text:
         return
     name = message.text.strip()
     if not name or "/" in name or "\\" in name or name.startswith("."):
@@ -1039,81 +985,86 @@ async def process_new_project_name(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "proj_remove_menu")
 async def cb_project_remove_menu(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    projects = load_projects()
-    if len(projects) <= 1:
+    if isinstance(callback.message, types.Message):
+        projects = load_projects()
+        if len(projects) <= 1:
+            await callback.message.answer(
+                "Operation denied: Cannot remove the last remaining project."
+            )
+            await callback.answer()
+            return
+        builder = InlineKeyboardBuilder()
+        for p in projects:
+            builder.button(
+                text=f"❌ {p['name']}", callback_data=f"proj_rm_{p['name']}"[:64]
+            )
+        builder.adjust(1)
+        builder.row(InlineKeyboardButton(text="Cancel", callback_data="proj_rm_cancel"))
         await callback.message.answer(
-            "Operation denied: Cannot remove the last remaining project."
+            "Select the project to unregister:", reply_markup=builder.as_markup()
         )
-        await callback.answer()
-        return
-    builder = InlineKeyboardBuilder()
-    for p in projects:
-        builder.button(
-            text=f"❌ {p['name']}", callback_data=f"proj_rm_{p['name']}"[:64]
-        )
-    builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="Cancel", callback_data="proj_rm_cancel"))
-    await callback.message.answer(
-        "Select the project to unregister:", reply_markup=builder.as_markup()
-    )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("proj_rm_"))
 async def cb_project_remove(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    if callback.data == "proj_rm_cancel":
-        await callback.message.delete()
-        await callback.answer()
+    if not callback.data:
         return
-    name = callback.data.replace("proj_rm_", "")
-    if remove_project(name):
-        await callback.message.edit_text(f"Project successfully unregistered: {name}")
-        write_log("PROJECT", f"Unregistered workspace project: {name}")
-    else:
-        await callback.message.edit_text(f"Error: Project identifier not found: {name}")
+    if isinstance(callback.message, types.Message):
+        if callback.data == "proj_rm_cancel":
+            await callback.message.delete()
+            await callback.answer()
+            return
+        name = callback.data.replace("proj_rm_", "")
+        if remove_project(name):
+            await callback.message.edit_text(f"Project successfully unregistered: {name}")
+            write_log("PROJECT", f"Unregistered workspace project: {name}")
+        else:
+            await callback.message.edit_text(f"Error: Project identifier not found: {name}")
     await callback.answer()
 
 
 @dp.callback_query(F.data == "proj_scan")
 async def cb_project_scan(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
         return
-    if not PROJECTS_BASE_DIR.exists():
-        await callback.message.answer(
-            f"Base workspace directory not found:\n`{PROJECTS_BASE_DIR}`",
-            parse_mode="Markdown",
-        )
-        await callback.answer()
-        return
-    projects = load_projects()
-    existing_paths = {p["path"] for p in projects}
-    added = []
-    for d in sorted(PROJECTS_BASE_DIR.iterdir()):
-        if d.is_dir() and not d.name.startswith(".") and str(d) not in existing_paths:
-            projects.append({"name": d.name, "path": str(d), "active": False})
-            added.append(d.name)
-    if added:
-        save_projects(projects)
-        await callback.message.answer(
-            f"Discovered {len(added)} new directory(s):\n"
-            + "\n".join(f"  {n}" for n in added),
-            reply_markup=get_projects_keyboard(),
-        )
-        write_log("PROJECT", f"Scan registered: {', '.join(added)}")
-    else:
-        await callback.message.answer(
-            "Scan complete. No unindexed project directories found."
-        )
+    if isinstance(callback.message, types.Message):
+        if not PROJECTS_BASE_DIR.exists():
+            await callback.message.answer(
+                f"Base workspace directory not found:\n`{PROJECTS_BASE_DIR}`",
+                parse_mode="Markdown",
+            )
+            await callback.answer()
+            return
+        projects = load_projects()
+        existing_paths = {p["path"] for p in projects}
+        added = []
+        for d in sorted(PROJECTS_BASE_DIR.iterdir()):
+            if d.is_dir() and not d.name.startswith(".") and str(d) not in existing_paths:
+                projects.append({"name": d.name, "path": str(d), "active": False})
+                added.append(d.name)
+        if added:
+            save_projects(projects)
+            await callback.message.answer(
+                f"Discovered {len(added)} new directory(s):\n"
+                + "\n".join(f"  {n}" for n in added),
+                reply_markup=get_projects_keyboard(),
+            )
+            write_log("PROJECT", f"Scan registered: {', '.join(added)}")
+        else:
+            await callback.message.answer(
+                "Scan complete. No unindexed project directories found."
+            )
     await callback.answer()
 
 
 @dp.message(F.text == "Plan")
 async def btn_plan(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await fetch_and_send_artifact(
         message, "/latest/plan", "implementation_plan.md", "Implementation Plan"
@@ -1122,7 +1073,7 @@ async def btn_plan(message: types.Message):
 
 @dp.message(F.text == "Task")
 async def btn_task(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await fetch_and_send_artifact(
         message, "/latest/task", "task.md", "Current Task Definition"
@@ -1131,7 +1082,7 @@ async def btn_task(message: types.Message):
 
 @dp.message(F.text == "Walkthrough")
 async def btn_walkthrough(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await fetch_and_send_artifact(
         message, "/latest/walkthrough", "walkthrough.md", "Task Walkthrough"
@@ -1169,7 +1120,7 @@ async def fetch_and_send_artifact(
 
 @dp.message(F.text == "Brain Files")
 async def btn_brain_files(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     await bot.send_chat_action(message.chat.id, "typing")
     try:
@@ -1198,40 +1149,43 @@ async def btn_brain_files(message: types.Message):
 
 @dp.callback_query(F.data.startswith("brainfile_"))
 async def cb_brain_file(callback: types.CallbackQuery):
-    if not is_allowed(callback.from_user.id):
+    if not callback.from_user or not is_allowed(callback.from_user.id):
+        return
+    if not callback.data:
         return
     filename = callback.data.replace("brainfile_", "")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{FILE_SERVICE_URL}/latest/file?name={filename}"
-            ) as resp:
-                if resp.status == 200:
-                    content = await resp.text()
-                    if len(content) < 3500:
-                        await callback.message.answer(
-                            f"*{filename}*:\n\n```\n{content}\n```",
-                            parse_mode="Markdown",
-                        )
+    if isinstance(callback.message, types.Message):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{FILE_SERVICE_URL}/latest/file?name={filename}"
+                ) as resp:
+                    if resp.status == 200:
+                        content = await resp.text()
+                        if len(content) < 3500:
+                            await callback.message.answer(
+                                f"*{filename}*:\n\n```\n{content}\n```",
+                                parse_mode="Markdown",
+                            )
+                        else:
+                            tmp = ARTIFACTS_DIR / filename
+                            with open(tmp, "w", encoding="utf-8") as f:
+                                f.write(content)
+                            await callback.message.answer_document(
+                                FSInputFile(tmp), caption=filename
+                            )
                     else:
-                        tmp = ARTIFACTS_DIR / filename
-                        with open(tmp, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        await callback.message.answer_document(
-                            FSInputFile(tmp), caption=filename
+                        await callback.message.answer(
+                            f"Artifact not found on server: {filename}"
                         )
-                else:
-                    await callback.message.answer(
-                        f"Artifact not found on server: {filename}"
-                    )
-    except Exception as e:
-        await callback.message.answer(f"Retrieval error: {e}")
+        except Exception as e:
+            await callback.message.answer(f"Retrieval error: {e}")
     await callback.answer()
 
 
 @dp.message(F.text == "Logs")
 async def btn_logs(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
         return
     if not LOG_FILE.exists():
         await message.answer(
@@ -1249,7 +1203,9 @@ async def btn_logs(message: types.Message):
 
 @dp.message(F.text)
 async def handle_prompt(message: types.Message):
-    if not is_allowed(message.from_user.id):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+    if not message.text:
         return
     global _active_chat_id
     _active_chat_id = message.chat.id
@@ -1257,7 +1213,6 @@ async def handle_prompt(message: types.Message):
     if not text:
         return
 
-    # Ignore button labels that somehow reach this handler.
     if text in {
         "Prompt", "Refresh", "Plan", "Task", "Walkthrough",
         "Mode/Model", "New Chat", "Stop", "Logs",
@@ -1285,10 +1240,6 @@ async def handle_prompt(message: types.Message):
             f"Failed to establish connection: {e}", reply_markup=get_main_menu()
         )
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 async def main() -> None:
     tg_log.info("Telegram bridge initialized. Starting polling...")

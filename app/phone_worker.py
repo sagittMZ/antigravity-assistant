@@ -2,16 +2,8 @@
 phone_worker.py — FastAPI gateway to Phone Connect REST API.
 
 CHANGES vs previous version:
-- Fixed the word-waterfall problem (one word per line in Telegram).
-  Root cause: Antigravity streams Thought Process by putting each word in
-  its own <span>/<div>. BS4 with separator="\n" extracts them one-per-line.
-  Fix: _extract_text_smart() detects this pattern heuristically (>60% of
-  lines are 1-2 words) and collapses them back into readable sentences via
-  _collapse_waterfall(). Normal multi-paragraph messages are unaffected.
-- Fallback branch now actually returns a result (was silently returning []).
-- Removed print() → pw_log via RotatingFileHandler.
-- Added _auth_lock for concurrent auth safety.
-- No Playwright — pure aiohttp REST calls to Phone Connect.
+- Fixed Pyright strict typing errors (Optional[dict], aiohttp **kwargs typing).
+- Added safe HTML class attribute extractor (_get_classes) to fix OptionalIterable errors.
 """
 from __future__ import annotations
 
@@ -20,7 +12,7 @@ import os
 import re
 import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -69,7 +61,6 @@ def _get_cookie_jar() -> aiohttp.CookieJar:
 
 
 async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
-    """Authenticate with double-checked locking to prevent duplicate logins."""
     global _authenticated
     if _authenticated:
         return True
@@ -78,7 +69,7 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
         return True
 
     async with _auth_lock:
-        if _authenticated:  # re-check after acquiring lock
+        if _authenticated:
             return True
         try:
             async with session.post(
@@ -99,7 +90,7 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
             return False
 
 
-async def _pc_request(method: str, path: str, json_data: dict = None) -> dict:
+async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]] = None) -> dict:
     jar = _get_cookie_jar()
     ssl_ctx = _make_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
@@ -114,16 +105,17 @@ async def _pc_request(method: str, path: str, json_data: dict = None) -> dict:
         timeout = aiohttp.ClientTimeout(total=15)
 
         try:
-            kw = dict(headers=headers, timeout=timeout)
+            # Explicitly pass arguments to avoid Pyright dict unpacking type errors
             if method == "GET":
-                async with session.get(url, **kw) as resp:
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
                     if resp.status == 401:
                         global _authenticated
                         _authenticated = False
                         raise HTTPException(502, "Phone Connect authentication lost")
                     return await resp.json()
             else:
-                async with session.post(url, json=json_data or {}, **kw) as resp:
+                payload = json_data if json_data is not None else {}
+                async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                     if resp.status == 401:
                         _authenticated = False
                         raise HTTPException(502, "Phone Connect authentication lost")
@@ -161,6 +153,31 @@ async def send_message(req: SendMessageRequest):
 @app.get("/snapshot")
 async def get_snapshot():
     return await _pc_request("GET", "/snapshot")
+
+@app.get("/snapshot/hash")
+async def get_snapshot_hash_fast():
+    jar = _get_cookie_jar()
+    ssl_ctx = _make_ssl_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
+
+    async with aiohttp.ClientSession(cookie_jar=jar, connector=connector) as session:
+        await _ensure_auth(session)
+        url = f"{PHONE_CONNECT_URL}/snapshot"
+        headers = {"ngrok-skip-browser-warning": "true"}
+        
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 401:
+                    global _authenticated
+                    _authenticated = False
+                    raise HTTPException(502, "Phone Connect authentication lost")
+                
+                hasher = hashlib.md5()
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    hasher.update(chunk)
+                return {"hash": hasher.hexdigest()}
+        except Exception as exc:
+            raise HTTPException(502, f"Phone Connect unreachable: {exc}")
 
 @app.get("/snapshot/text")
 async def get_snapshot_text():
@@ -215,7 +232,6 @@ async def init_session():
 
 # ---------------------------------------------------------------------------
 # Text detection and cleaning
-# Regex operates on plain strings AFTER BS4 extraction — never on raw HTML.
 # ---------------------------------------------------------------------------
 
 _RE_WS        = re.compile(r"[ \t]+")
@@ -260,19 +276,6 @@ _UI_CHROME: set[str] = {
 
 
 def _is_word_waterfall(text: str) -> bool:
-    """Detect Antigravity's streaming Thought Process rendering.
-
-    During streaming, each word lands in its own <span>/<div>.
-    After BS4 extraction with separator="\\n", this becomes one-word-per-line:
-        I
-        am
-        analyzing
-        the
-        problem
-
-    Heuristic: >60% of non-empty lines have 1-2 tokens AND
-    there are at least 10 such lines (avoid false positives on short lists).
-    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if len(lines) < 10:
         return False
@@ -281,29 +284,13 @@ def _is_word_waterfall(text: str) -> bool:
 
 
 def _collapse_waterfall(text: str) -> str:
-    """Re-join waterfall lines into readable paragraphs.
-
-    Groups consecutive non-empty lines into a single paragraph joined by spaces.
-    An empty line in the source becomes a paragraph separator (blank line).
-
-    Input:                      Output:
-        I                           I am analyzing the problem.
-        am
-        analyzing                   This is the second paragraph.
-        the
-        problem.
-
-        This
-        is the second
-        paragraph.
-    """
     lines = text.split("\n")
     paragraphs: list[list[str]] = [[]]
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            if paragraphs[-1]:      # close current paragraph on blank line
+            if paragraphs[-1]:
                 paragraphs.append([])
         else:
             paragraphs[-1].append(stripped)
@@ -312,13 +299,7 @@ def _collapse_waterfall(text: str) -> str:
     return "\n\n".join(parts)
 
 
-def _extract_text_smart(tag) -> str:
-    """Extract text from a BS4 element with waterfall detection.
-
-    1. Extract with separator="\\n" to preserve paragraph structure.
-    2. If the result is a word-waterfall, collapse it into sentences.
-    3. Normal multi-paragraph messages pass through unchanged.
-    """
+def _extract_text_smart(tag: Any) -> str:
     text = tag.get_text(separator="\n", strip=True)
     if _is_word_waterfall(text):
         text = _collapse_waterfall(text)
@@ -326,7 +307,6 @@ def _extract_text_smart(tag) -> str:
 
 
 def _clean_text(raw: str) -> str:
-    """Clean plain text: remove ANSI, CSS artifacts, shell noise, UI chrome."""
     text = _RE_ANSI.sub("", raw)
     text = _RE_CSS.sub("", text)
     text = _RE_GIT.sub("", text)
@@ -377,17 +357,25 @@ def _stable_hash(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DOM parsing — BS4 only. Regex never runs on raw HTML.
+# DOM parsing
 # ---------------------------------------------------------------------------
 
-def parse_messages_from_html(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
+def _safe_get_classes(tag: Any) -> list[str]:
+    """Safe extraction of class attribute to satisfy Pyright typing."""
+    cls_attr = tag.get("class")
+    if isinstance(cls_attr, list):
+        return [str(c) for c in cls_attr]
+    if isinstance(cls_attr, str):
+        return [cls_attr]
+    return []
 
-    # Remove non-content tags.
+
+def parse_messages_from_html(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+
     for tag in soup(["style", "script", "noscript", "template", "svg", "canvas"]):
         tag.decompose()
 
-    # Remove IDE chrome (terminals, editors).
     for tag in soup.find_all(
         class_=re.compile(r"xterm|terminal|cm-editor|cm-content|monaco-editor", re.I)
     ):
@@ -395,19 +383,18 @@ def parse_messages_from_html(html: str) -> list[dict]:
 
     messages: list[dict] = []
 
-    # Try structured message blocks first.
     blocks = soup.find_all(
         lambda t: t.name == "div"
         and (
             t.has_attr("data-message")
-            or any("message" in c.lower() for c in t.get("class", []))
+            or any("message" in c.lower() for c in _safe_get_classes(t))
         )
     )
 
     if not blocks:
-        # Fallback: full page as one message.
-        # _extract_text_smart handles waterfall even here.
         text = _extract_text_smart(soup)
+        if len(text) > 15000:
+            text = text[:15000] + "\n\n...[TRUNCATED FOR MEMORY SAFETY]..."
         text = _clean_text(text)
         if _is_meaningful(text):
             return [{"role": "assistant", "text": text, "hash": _stable_hash(text)}]
@@ -415,12 +402,16 @@ def parse_messages_from_html(html: str) -> list[dict]:
 
     for block in blocks:
         text = _extract_text_smart(block)
+        
+        if len(text) > 15000:
+            text = text[:15000] + "\n\n...[TRUNCATED FOR MEMORY SAFETY]..."
+            
         text = _clean_text(text)
         if not _is_meaningful(text):
             continue
 
         role = "assistant"
-        classes = " ".join(block.get("class", [])).lower()
+        classes = " ".join(_safe_get_classes(block)).lower()
         if "user" in classes:
             role = "user"
 
