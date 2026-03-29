@@ -1,3 +1,9 @@
+"""
+phone_worker.py — FastAPI gateway to Phone Connect REST API.
+
+Provides a decoupled, memory-safe bridge between the Telegram bot
+and the underlying AntiGravity local instance.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,9 +22,9 @@ import ssl as _ssl
 from app.logger import setup_logger
 
 try:
-    from bs4 import BeautifulSoup, Tag
+    from bs4 import BeautifulSoup
 except ImportError:
-    raise RuntimeError("BeautifulSoup is missing. Run: pip install beautifulsoup4 lxml")
+    raise RuntimeError("BeautifulSoup is missing. Run: pip install beautifulsoup4")
 
 BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -34,10 +40,10 @@ app = FastAPI(title="Phone Worker — Antigravity Assistant")
 
 _cookie_jar: Optional[aiohttp.CookieJar] = None
 _authenticated = False
-_auth_lock = asyncio.Lock()
 
 
 def _make_ssl_context() -> Optional[_ssl.SSLContext]:
+    """Bypass strict SSL verification for local self-signed endpoints."""
     if PHONE_CONNECT_URL.startswith("https"):
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
@@ -47,6 +53,7 @@ def _make_ssl_context() -> Optional[_ssl.SSLContext]:
 
 
 def _get_cookie_jar() -> aiohttp.CookieJar:
+    """Maintain a singleton cookie jar to persist session state across requests."""
     global _cookie_jar
     if _cookie_jar is None:
         _cookie_jar = aiohttp.CookieJar(unsafe=True)
@@ -54,6 +61,7 @@ def _get_cookie_jar() -> aiohttp.CookieJar:
 
 
 async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
+    """Authenticate against Phone Connect API."""
     global _authenticated
     if _authenticated:
         return True
@@ -61,29 +69,27 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
         _authenticated = True
         return True
 
-    async with _auth_lock:
-        if _authenticated:
-            return True
-        try:
-            async with session.post(
-                f"{PHONE_CONNECT_URL}/login",
-                json={"password": PHONE_CONNECT_PASSWORD},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                data = await resp.json()
-                if isinstance(data, dict) and data.get("success"):
-                    _authenticated = True
-                    pw_log.info("Authenticated against Phone Connect.")
-                    return True
-                pw_log.warning(f"Phone Connect auth rejected: {data}")
-                return False
-        except Exception as exc:
-            pw_log.warning(f"Phone Connect auth failed: {exc}")
+    try:
+        async with session.post(
+            f"{PHONE_CONNECT_URL}/login",
+            json={"password": PHONE_CONNECT_PASSWORD},
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json()
+            if isinstance(data, dict) and data.get("success"):
+                _authenticated = True
+                pw_log.info("Authenticated against Phone Connect.")
+                return True
+            pw_log.warning(f"Phone Connect auth rejected: {data}")
             return False
+    except Exception as exc:
+        pw_log.warning(f"Phone Connect auth failed: {exc}")
+        return False
 
 
 async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Unified HTTP client for Phone Connect communication with built-in auth checks."""
     jar = _get_cookie_jar()
     ssl_ctx = _make_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
@@ -150,28 +156,20 @@ async def get_snapshot():
 
 @app.get("/snapshot/hash")
 async def get_snapshot_hash_fast():
-    jar = _get_cookie_jar()
-    ssl_ctx = _make_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
-
-    async with aiohttp.ClientSession(cookie_jar=jar, connector=connector) as session:
-        await _ensure_auth(session)
-        url = f"{PHONE_CONNECT_URL}/snapshot"
-        headers = {"ngrok-skip-browser-warning": "true"}
-        
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 401:
-                    global _authenticated
-                    _authenticated = False
-                    raise HTTPException(502, "Phone Connect authentication lost")
-                
-                hasher = hashlib.md5()
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    hasher.update(chunk)
-                return {"hash": hasher.hexdigest()}
-        except Exception as exc:
-            raise HTTPException(502, f"Phone Connect unreachable: {exc}")
+    """
+    ARCH NOTE: Computes DOM hash locally on the worker.
+    Prevents massive memory allocation and network overhead on the bot side 
+    during aggressive polling loops.
+    """
+    try:
+        raw = await _pc_request("GET", "/snapshot")
+        html = str(raw.get("html", ""))
+        if not html:
+            return {"hash": ""}
+        return {"hash": hashlib.md5(html.encode()).hexdigest()}
+    except Exception as e:
+        pw_log.error(f"Hash fetch error: {e}")
+        return {"hash": ""}
 
 @app.get("/snapshot/text")
 async def get_snapshot_text():
@@ -225,7 +223,7 @@ async def init_session():
 
 
 # ---------------------------------------------------------------------------
-# Text detection and cleaning
+# Text Detection and Sanitization Pipeline
 # ---------------------------------------------------------------------------
 
 _RE_WS        = re.compile(r"[ \t]+")
@@ -270,6 +268,10 @@ _UI_CHROME: set[str] = {
 
 
 def _is_word_waterfall(text: str) -> bool:
+    """
+    Detects chunked token streaming where each word is rendered on a new line.
+    Prevents UI flood in Telegram clients.
+    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if len(lines) < 10:
         return False
@@ -278,6 +280,7 @@ def _is_word_waterfall(text: str) -> bool:
 
 
 def _collapse_waterfall(text: str) -> str:
+    """Restores sentence coherence from token-streamed waterfalls."""
     lines = text.split("\n")
     paragraphs: list[list[str]] = [[]]
 
@@ -301,6 +304,14 @@ def _extract_text_smart(tag: Any) -> str:
 
 
 def _clean_text(raw: str) -> str:
+    """
+    Sanitize extracted DOM text to reduce token footprint for the LLM.
+    WARN: Truncation applied at 15k chars to prevent Catastrophic Backtracking 
+    in the regex engine when processing massive server logs or git diffs.
+    """
+    if len(raw) > 15000:
+        raw = raw[:15000] + "\n\n...[TRUNCATED FOR SYSTEM STABILITY]..."
+
     text = _RE_ANSI.sub("", raw)
     text = _RE_CSS.sub("", text)
     text = _RE_GIT.sub("", text)
@@ -334,6 +345,7 @@ def _clean_text(raw: str) -> str:
 
 
 def _is_meaningful(text: str) -> bool:
+    """Filters out low-entropy or pure noise segments."""
     if len(text) < 10:
         return False
     words = text.split()
@@ -351,20 +363,24 @@ def _stable_hash(text: str) -> str:
 
 
 def _safe_get_classes(tag: Any) -> list[str]:
-    cls_attr = tag.get("class")
-    if isinstance(cls_attr, list):
-        return [str(c) for c in cls_attr]
-    if isinstance(cls_attr, str):
-        return [cls_attr]
-    return []
+    """Safe extraction of class attributes to satisfy Pyright static analysis."""
+    c = tag.get("class")
+    if not c: return []
+    if isinstance(c, str): return [c]
+    return [str(x) for x in c]
 
 
 # ---------------------------------------------------------------------------
-# DOM parsing
+# DOM Parsing
 # ---------------------------------------------------------------------------
 
 def parse_messages_from_html(html: str) -> list[dict[str, str]]:
-    soup = BeautifulSoup(html, "lxml")
+    """
+    ARCH NOTE: Reverted back to html.parser from lxml.
+    While lxml is faster, it can silently drop malformed DOM nodes generated 
+    by dynamic IDE interfaces, causing the bot to "go blind" to chat updates.
+    """
+    soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["style", "script", "noscript", "template", "svg", "canvas"]):
         tag.decompose()
@@ -386,8 +402,6 @@ def parse_messages_from_html(html: str) -> list[dict[str, str]]:
 
     if not blocks:
         text = _extract_text_smart(soup)
-        if len(text) > 15000:
-            text = text[:15000] + "\n\n...[TRUNCATED]..."
         text = _clean_text(text)
         if _is_meaningful(text):
             return [{"role": "assistant", "text": text, "hash": _stable_hash(text)}]
@@ -395,9 +409,6 @@ def parse_messages_from_html(html: str) -> list[dict[str, str]]:
 
     for block in blocks:
         text = _extract_text_smart(block)
-        if len(text) > 15000:
-            text = text[:15000] + "\n\n...[TRUNCATED]..."
-            
         text = _clean_text(text)
         if not _is_meaningful(text):
             continue
