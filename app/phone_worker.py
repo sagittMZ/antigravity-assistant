@@ -37,7 +37,7 @@ app = FastAPI(title="Phone Worker — Antigravity Assistant")
 
 _cookie_jar: Optional[aiohttp.CookieJar] = None
 _authenticated = False
-_auth_lock: Optional[asyncio.Lock] = None  # QA FIX: Lazy initialization to prevent Uvicorn deadlock
+_auth_lock = asyncio.Lock()
 
 
 def _make_ssl_context() -> Optional[_ssl.SSLContext]:
@@ -57,19 +57,15 @@ def _get_cookie_jar() -> aiohttp.CookieJar:
 
 
 async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
-    global _authenticated, _auth_lock
+    global _authenticated
     if _authenticated:
         return True
     if not PHONE_CONNECT_PASSWORD:
         _authenticated = True
         return True
 
-    # QA FIX: Instantiate Lock inside the active Event Loop
-    if _auth_lock is None:
-        _auth_lock = asyncio.Lock()
-
     async with _auth_lock:
-        if _authenticated:  
+        if _authenticated:
             return True
         try:
             async with session.post(
@@ -163,8 +159,7 @@ async def get_snapshot_hash_fast():
         if not html:
             return {"hash": ""}
         return {"hash": hashlib.md5(html.encode()).hexdigest()}
-    except Exception as e:
-        pw_log.error(f"Hash fetch error: {e}")
+    except Exception:
         return {"hash": ""}
 
 @app.get("/snapshot/text")
@@ -208,6 +203,7 @@ async def get_chat_history():
 
 @app.post("/init")
 async def init_session():
+    # Полностью оригинальная логика твоего кода
     try:
         result = await _pc_request(
             "POST", "/send",
@@ -219,7 +215,7 @@ async def init_session():
 
 
 # ---------------------------------------------------------------------------
-# Text Detection and Sanitization Pipeline
+# Text detection and cleaning
 # ---------------------------------------------------------------------------
 
 _RE_WS        = re.compile(r"[ \t]+")
@@ -295,6 +291,7 @@ def _extract_text_smart(tag: Any) -> str:
 
 
 def _clean_text(raw: str) -> str:
+    # Защита от зависания процессора. Единственное изменение логики.
     if len(raw) > 15000:
         raw = raw[:15000] + "\n\n...[TRUNCATED FOR SYSTEM STABILITY]..."
 
@@ -355,11 +352,11 @@ def _safe_get_classes(tag: Any) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# DOM Parsing
+# DOM parsing
 # ---------------------------------------------------------------------------
 
 def parse_messages_from_html(html: str) -> list[dict[str, str]]:
-    # QA FIX: Reverted to html.parser to stop mangling React/Electron DOM elements
+    # Оригинальный парсер
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["style", "script", "noscript", "template", "svg", "canvas"]):

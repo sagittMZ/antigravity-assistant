@@ -1,8 +1,5 @@
 """
 tg_bot.py — Telegram Client Gateway for AntiGravity AI.
-
-Handles bidirectional long-polling, message deduplication, and 
-maintains session persistence across background worker restarts.
 """
 from __future__ import annotations
 
@@ -79,8 +76,6 @@ _waiting_for_response = False
 _bg_watcher_running = False
 _bg_last_hash: Optional[str] = None
 
-# ARCH NOTE: Persisted via SQLite to survive service restarts.
-# Mitigates UI flooding where the bot re-transmits old context after a crash.
 _bg_baseline_hashes: set[str] = set(cast(list[str], get_val("bg_baseline_hashes", [])))
 
 _active_chat_id: Optional[int] = None
@@ -257,7 +252,6 @@ def _text_prefix(text: str, length: int = 120) -> str:
 
 
 def _is_duplicate(text: str) -> bool:
-    """Sliding window deduplication to prevent cyclical message loops."""
     prefix = _text_prefix(text)
     if not prefix:
         return True
@@ -500,7 +494,12 @@ def get_mode_keyboard():
 
 _model_cache: dict[str, Any] = {"models": [], "fetched_at": 0}
 MODEL_CACHE_TTL = 300
-FALLBACK_MODELS: list[str] = []
+FALLBACK_MODELS: list[str] = [
+    "Gemini 2.5 Flash",
+    "Gemini 2.5 Pro",
+    "Claude Sonnet 4",
+    "Claude Opus 4",
+]
 
 
 async def fetch_available_models() -> list[str]:
