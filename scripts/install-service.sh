@@ -45,11 +45,6 @@ ExecStart=$VENV_PYTHON -m app.launcher
 Restart=on-failure
 RestartSec=10
 
-# QA FIX: Hard memory limits to prevent OS Swap Death
-MemoryMax=1500M
-MemorySwapMax=0M
-OOMPolicy=restart
-
 EnvironmentFile=$PROJECT_DIR/.env
 Environment=DISPLAY=:0
 Environment=PYTHONUNBUFFERED=1

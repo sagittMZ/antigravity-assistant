@@ -1,8 +1,5 @@
 """
 phone_worker.py — FastAPI gateway to Phone Connect REST API.
-
-Provides a decoupled, memory-safe bridge between the Telegram bot
-and the underlying AntiGravity local instance.
 """
 from __future__ import annotations
 
@@ -40,10 +37,10 @@ app = FastAPI(title="Phone Worker — Antigravity Assistant")
 
 _cookie_jar: Optional[aiohttp.CookieJar] = None
 _authenticated = False
+_auth_lock: Optional[asyncio.Lock] = None  # QA FIX: Lazy initialization to prevent Uvicorn deadlock
 
 
 def _make_ssl_context() -> Optional[_ssl.SSLContext]:
-    """Bypass strict SSL verification for local self-signed endpoints."""
     if PHONE_CONNECT_URL.startswith("https"):
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
@@ -53,7 +50,6 @@ def _make_ssl_context() -> Optional[_ssl.SSLContext]:
 
 
 def _get_cookie_jar() -> aiohttp.CookieJar:
-    """Maintain a singleton cookie jar to persist session state across requests."""
     global _cookie_jar
     if _cookie_jar is None:
         _cookie_jar = aiohttp.CookieJar(unsafe=True)
@@ -61,35 +57,40 @@ def _get_cookie_jar() -> aiohttp.CookieJar:
 
 
 async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
-    """Authenticate against Phone Connect API."""
-    global _authenticated
+    global _authenticated, _auth_lock
     if _authenticated:
         return True
     if not PHONE_CONNECT_PASSWORD:
         _authenticated = True
         return True
 
-    try:
-        async with session.post(
-            f"{PHONE_CONNECT_URL}/login",
-            json={"password": PHONE_CONNECT_PASSWORD},
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            data = await resp.json()
-            if isinstance(data, dict) and data.get("success"):
-                _authenticated = True
-                pw_log.info("Authenticated against Phone Connect.")
-                return True
-            pw_log.warning(f"Phone Connect auth rejected: {data}")
+    # QA FIX: Instantiate Lock inside the active Event Loop
+    if _auth_lock is None:
+        _auth_lock = asyncio.Lock()
+
+    async with _auth_lock:
+        if _authenticated:  
+            return True
+        try:
+            async with session.post(
+                f"{PHONE_CONNECT_URL}/login",
+                json={"password": PHONE_CONNECT_PASSWORD},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json()
+                if isinstance(data, dict) and data.get("success"):
+                    _authenticated = True
+                    pw_log.info("Authenticated against Phone Connect.")
+                    return True
+                pw_log.warning(f"Phone Connect auth rejected: {data}")
+                return False
+        except Exception as exc:
+            pw_log.warning(f"Phone Connect auth failed: {exc}")
             return False
-    except Exception as exc:
-        pw_log.warning(f"Phone Connect auth failed: {exc}")
-        return False
 
 
 async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Unified HTTP client for Phone Connect communication with built-in auth checks."""
     jar = _get_cookie_jar()
     ssl_ctx = _make_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
@@ -156,11 +157,6 @@ async def get_snapshot():
 
 @app.get("/snapshot/hash")
 async def get_snapshot_hash_fast():
-    """
-    ARCH NOTE: Computes DOM hash locally on the worker.
-    Prevents massive memory allocation and network overhead on the bot side 
-    during aggressive polling loops.
-    """
     try:
         raw = await _pc_request("GET", "/snapshot")
         html = str(raw.get("html", ""))
@@ -268,10 +264,6 @@ _UI_CHROME: set[str] = {
 
 
 def _is_word_waterfall(text: str) -> bool:
-    """
-    Detects chunked token streaming where each word is rendered on a new line.
-    Prevents UI flood in Telegram clients.
-    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if len(lines) < 10:
         return False
@@ -280,7 +272,6 @@ def _is_word_waterfall(text: str) -> bool:
 
 
 def _collapse_waterfall(text: str) -> str:
-    """Restores sentence coherence from token-streamed waterfalls."""
     lines = text.split("\n")
     paragraphs: list[list[str]] = [[]]
 
@@ -304,11 +295,6 @@ def _extract_text_smart(tag: Any) -> str:
 
 
 def _clean_text(raw: str) -> str:
-    """
-    Sanitize extracted DOM text to reduce token footprint for the LLM.
-    WARN: Truncation applied at 15k chars to prevent Catastrophic Backtracking 
-    in the regex engine when processing massive server logs or git diffs.
-    """
     if len(raw) > 15000:
         raw = raw[:15000] + "\n\n...[TRUNCATED FOR SYSTEM STABILITY]..."
 
@@ -345,7 +331,6 @@ def _clean_text(raw: str) -> str:
 
 
 def _is_meaningful(text: str) -> bool:
-    """Filters out low-entropy or pure noise segments."""
     if len(text) < 10:
         return False
     words = text.split()
@@ -363,7 +348,6 @@ def _stable_hash(text: str) -> str:
 
 
 def _safe_get_classes(tag: Any) -> list[str]:
-    """Safe extraction of class attributes to satisfy Pyright static analysis."""
     c = tag.get("class")
     if not c: return []
     if isinstance(c, str): return [c]
@@ -375,11 +359,7 @@ def _safe_get_classes(tag: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def parse_messages_from_html(html: str) -> list[dict[str, str]]:
-    """
-    ARCH NOTE: Reverted back to html.parser from lxml.
-    While lxml is faster, it can silently drop malformed DOM nodes generated 
-    by dynamic IDE interfaces, causing the bot to "go blind" to chat updates.
-    """
+    # QA FIX: Reverted to html.parser to stop mangling React/Electron DOM elements
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["style", "script", "noscript", "template", "svg", "canvas"]):
