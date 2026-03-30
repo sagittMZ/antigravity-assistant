@@ -1,6 +1,3 @@
-"""
-phone_worker.py — FastAPI gateway to Phone Connect REST API.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +5,7 @@ import os
 import re
 import hashlib
 from pathlib import Path
-from typing import Optional, Any, cast
+from typing import Optional, Any, cast, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -19,9 +16,9 @@ import ssl as _ssl
 from app.logger import setup_logger
 
 try:
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Tag
 except ImportError:
-    raise RuntimeError("BeautifulSoup is missing. Run: pip install beautifulsoup4")
+    raise RuntimeError("BeautifulSoup is missing. Run: pip install beautifulsoup4 lxml")
 
 BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -86,7 +83,15 @@ async def _ensure_auth(session: aiohttp.ClientSession) -> bool:
             return False
 
 
-async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+# NOTE: Dict[str, Any] instead of dict[str, Any] — Python 3.8 compatibility.
+# dict[str, Any] as a generic alias is only supported from Python 3.9+.
+# FastAPI introspects return type annotations at import time via Pydantic,
+# which triggers the 'type object is not subscriptable' error on 3.8.
+async def _pc_request(
+    method: str,
+    path: str,
+    json_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     jar = _get_cookie_jar()
     ssl_ctx = _make_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
@@ -108,7 +113,7 @@ async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]
                         _authenticated = False
                         raise HTTPException(502, "Phone Connect authentication lost")
                     res = await resp.json()
-                    return cast(dict[str, Any], res)
+                    return cast(Dict[str, Any], res)
             else:
                 payload = json_data if json_data is not None else {}
                 async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
@@ -116,7 +121,7 @@ async def _pc_request(method: str, path: str, json_data: Optional[dict[str, Any]
                         _authenticated = False
                         raise HTTPException(502, "Phone Connect authentication lost")
                     res = await resp.json()
-                    return cast(dict[str, Any], res)
+                    return cast(Dict[str, Any], res)
         except aiohttp.ClientError as exc:
             raise HTTPException(502, f"Phone Connect unreachable: {exc}")
 
@@ -132,7 +137,7 @@ class SetModelRequest(BaseModel):
 
 
 @app.get("/health")
-async def health():
+async def health() -> Dict[str, Any]:
     try:
         pc = await _pc_request("GET", "/health")
         return {"status": "ok", "phone_connect": pc}
@@ -140,7 +145,7 @@ async def health():
         return {"status": "degraded", "phone_connect_error": str(exc)}
 
 @app.post("/send_message")
-async def send_message(req: SendMessageRequest):
+async def send_message(req: SendMessageRequest) -> Dict[str, Any]:
     text = req.text.strip()
     if not text:
         raise HTTPException(400, "Empty text")
@@ -148,22 +153,36 @@ async def send_message(req: SendMessageRequest):
     return {"status": "ok", "result": result}
 
 @app.get("/snapshot")
-async def get_snapshot():
+async def get_snapshot() -> Dict[str, Any]:
     return await _pc_request("GET", "/snapshot")
 
 @app.get("/snapshot/hash")
-async def get_snapshot_hash_fast():
-    try:
-        raw = await _pc_request("GET", "/snapshot")
-        html = str(raw.get("html", ""))
-        if not html:
-            return {"hash": ""}
-        return {"hash": hashlib.md5(html.encode()).hexdigest()}
-    except Exception:
-        return {"hash": ""}
+async def get_snapshot_hash_fast() -> Dict[str, Any]:
+    jar = _get_cookie_jar()
+    ssl_ctx = _make_ssl_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
+
+    async with aiohttp.ClientSession(cookie_jar=jar, connector=connector) as session:
+        await _ensure_auth(session)
+        url = f"{PHONE_CONNECT_URL}/snapshot"
+        headers = {"ngrok-skip-browser-warning": "true"}
+
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 401:
+                    global _authenticated
+                    _authenticated = False
+                    raise HTTPException(502, "Phone Connect authentication lost")
+
+                hasher = hashlib.md5()
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    hasher.update(chunk)
+                return {"hash": hasher.hexdigest()}
+        except Exception as exc:
+            raise HTTPException(502, f"Phone Connect unreachable: {exc}")
 
 @app.get("/snapshot/text")
-async def get_snapshot_text():
+async def get_snapshot_text() -> Dict[str, Any]:
     raw = await _pc_request("GET", "/snapshot")
     html = str(raw.get("html", ""))
     if not html:
@@ -172,38 +191,37 @@ async def get_snapshot_text():
     return {"messages": messages, "count": len(messages), "raw_length": len(html)}
 
 @app.get("/app-state")
-async def get_app_state():
+async def get_app_state() -> Dict[str, Any]:
     return await _pc_request("GET", "/app-state")
 
 @app.post("/set-mode")
-async def set_mode(req: SetModeRequest):
+async def set_mode(req: SetModeRequest) -> Dict[str, Any]:
     if req.mode not in ("Fast", "Planning"):
         raise HTTPException(400, "Mode must be 'Fast' or 'Planning'")
     return await _pc_request("POST", "/set-mode", {"mode": req.mode})
 
 @app.post("/set-model")
-async def set_model(req: SetModelRequest):
+async def set_model(req: SetModelRequest) -> Dict[str, Any]:
     return await _pc_request("POST", "/set-model", {"model": req.model})
 
 @app.get("/models")
-async def get_available_models():
+async def get_available_models() -> Dict[str, Any]:
     return await _pc_request("GET", "/models")
 
 @app.post("/stop")
-async def stop_generation():
+async def stop_generation() -> Dict[str, Any]:
     return await _pc_request("POST", "/stop")
 
 @app.post("/new-chat")
-async def new_chat():
+async def new_chat() -> Dict[str, Any]:
     return await _pc_request("POST", "/new-chat")
 
 @app.get("/chat-history")
-async def get_chat_history():
+async def get_chat_history() -> Dict[str, Any]:
     return await _pc_request("GET", "/chat-history")
 
 @app.post("/init")
-async def init_session():
-    # Полностью оригинальная логика твоего кода
+async def init_session() -> Dict[str, Any]:
     try:
         result = await _pc_request(
             "POST", "/send",
@@ -244,7 +262,7 @@ _RE_SYS_LOGS = re.compile(
     r"(\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\b)", re.IGNORECASE
 )
 
-_UI_CHROME: set[str] = {
+_UI_CHROME: set = {
     "always run", "cancel", "collapse all", "expand all",
     "open", "proceed", "copy", "retry", "undo", "running command",
     "running...", "running", "ran command", "relocate", "exit code 0",
@@ -269,7 +287,7 @@ def _is_word_waterfall(text: str) -> bool:
 
 def _collapse_waterfall(text: str) -> str:
     lines = text.split("\n")
-    paragraphs: list[list[str]] = [[]]
+    paragraphs: List[List[str]] = [[]]
 
     for line in lines:
         stripped = line.strip()
@@ -291,10 +309,6 @@ def _extract_text_smart(tag: Any) -> str:
 
 
 def _clean_text(raw: str) -> str:
-    # Защита от зависания процессора. Единственное изменение логики.
-    if len(raw) > 15000:
-        raw = raw[:15000] + "\n\n...[TRUNCATED FOR SYSTEM STABILITY]..."
-
     text = _RE_ANSI.sub("", raw)
     text = _RE_CSS.sub("", text)
     text = _RE_GIT.sub("", text)
@@ -305,7 +319,7 @@ def _clean_text(raw: str) -> str:
     text = _RE_SYS_LOGS.sub(r"\n\n\1", text)
 
     lines = text.split("\n")
-    cleaned: list[str] = []
+    cleaned: List[str] = []
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -344,20 +358,21 @@ def _stable_hash(text: str) -> str:
     return hashlib.md5(prefix.encode()).hexdigest()[:8]
 
 
-def _safe_get_classes(tag: Any) -> list[str]:
-    c = tag.get("class")
-    if not c: return []
-    if isinstance(c, str): return [c]
-    return [str(x) for x in c]
+def _safe_get_classes(tag: Any) -> List[str]:
+    cls_attr = tag.get("class")
+    if isinstance(cls_attr, list):
+        return [str(c) for c in cls_attr]
+    if isinstance(cls_attr, str):
+        return [cls_attr]
+    return []
 
 
 # ---------------------------------------------------------------------------
 # DOM parsing
 # ---------------------------------------------------------------------------
 
-def parse_messages_from_html(html: str) -> list[dict[str, str]]:
-    # Оригинальный парсер
-    soup = BeautifulSoup(html, "html.parser")
+def parse_messages_from_html(html: str) -> List[Dict[str, str]]:
+    soup = BeautifulSoup(html, "lxml")
 
     for tag in soup(["style", "script", "noscript", "template", "svg", "canvas"]):
         tag.decompose()
@@ -367,7 +382,7 @@ def parse_messages_from_html(html: str) -> list[dict[str, str]]:
     ):
         tag.decompose()
 
-    messages: list[dict[str, str]] = []
+    messages: List[Dict[str, str]] = []
 
     blocks = soup.find_all(
         lambda t: t.name == "div"
@@ -379,6 +394,8 @@ def parse_messages_from_html(html: str) -> list[dict[str, str]]:
 
     if not blocks:
         text = _extract_text_smart(soup)
+        if len(text) > 15000:
+            text = text[:15000] + "\n\n...[TRUNCATED]..."
         text = _clean_text(text)
         if _is_meaningful(text):
             return [{"role": "assistant", "text": text, "hash": _stable_hash(text)}]
@@ -386,6 +403,9 @@ def parse_messages_from_html(html: str) -> list[dict[str, str]]:
 
     for block in blocks:
         text = _extract_text_smart(block)
+        if len(text) > 15000:
+            text = text[:15000] + "\n\n...[TRUNCATED]..."
+
         text = _clean_text(text)
         if not _is_meaningful(text):
             continue
