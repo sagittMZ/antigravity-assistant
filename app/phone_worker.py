@@ -194,6 +194,25 @@ async def get_snapshot_text() -> Dict[str, Any]:
 async def get_app_state() -> Dict[str, Any]:
     return await _pc_request("GET", "/app-state")
 
+@app.get("/is-generating")
+async def is_generating() -> Dict[str, Any]:
+    """
+    Returns {"generating": bool} — True when Antigravity is mid-generation.
+    Used by tg_bot.py to gate final response delivery in collect-and-hold mode.
+    Falls back to False on any error so polling can still make progress.
+    """
+    try:
+        status = await _pc_request("GET", "/chat-status")
+        has_chat = status.get("hasChat", False)
+        editor_found = status.get("editorFound", True)
+        if has_chat and not editor_found:
+            return {"generating": True, "source": "editor_locked"}
+        return {"generating": False, "source": "editor_available"}
+    except Exception as exc:
+        pw_log.debug(f"is-generating fallback: {exc}")
+        return {"generating": False, "source": "error_fallback"}
+
+
 @app.post("/set-mode")
 async def set_mode(req: SetModeRequest) -> Dict[str, Any]:
     if req.mode not in ("Fast", "Planning"):
@@ -276,6 +295,82 @@ _UI_CHROME: set = {
     "finding conversation logs", "checking older artifacts", "stage:",
 }
 
+# FIX: CSS class patterns for thinking/reasoning container blocks.
+_THINKING_CLASS_RE = re.compile(
+    r"thinking|reasoning|collapsible|expandable|thought|planning-step|inner-monologue",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# FIX: Antigravity response formatter
+# Strips system/tool noise emitted during generation, extracts "Thought for Xs"
+# step headers as a compact italic summary, and restores paragraph structure.
+# Root bug: Antigravity DOM collapses everything to one line; noise patterns
+# like "Relocate open_in_new ... Thought for" consumed subsequent Thought blocks.
+# ---------------------------------------------------------------------------
+
+_RE_AG_NOISE = re.compile(
+    r'(?:'
+    r'Worked for \d+[^\s]*(?:\s\w+)?'                              # "Worked for 25s"
+    r'|Explored \d+[^T]*?(?=Thought|Analyzed|Ran|$)'                  # "Explored 6 files"
+    r'|Analyzed \S+(?:\s+(?!Analyzed|Thought|Ran|Checked|Exit|Always|Relocate)\S+){0,4}(?:\s+#L[\d-]+)?'
+    r'|Ran background command'
+    r'|Checked command status'
+    r'|Relocate open_in_new.*?(?=Thought for|\Z)'     # stop before next Thought block
+    r'|content_copy|Always run'
+    r'|Exit code \d+'
+    r'|undo\b|open_in_new)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# "Thought for Xs Title Case Header" — stop at first-person pronoun.
+_RE_AG_THOUGHT = re.compile(
+    r'Thought for (\d+)s?\s+([A-Z][^.!?]+?)(?=\s{1,3}(?:I\'ve|I\'m|I |My |The |Now |It ))',
+)
+
+_RE_AG_NUMBERED = re.compile(r'(?<=[а-яёА-ЯЁa-zA-Z.!? ])\s+(\d{1,2}\.\s+[А-ЯЁA-Z])')
+_RE_AG_PRIORITY = re.compile(r'(?<=[.!?а-яёА-ЯЁ])\s+(P[1-5]:|QA:|Stage:)')
+_RE_AG_CYRILLIC = re.compile(r'[А-ЯЁ][а-яёА-ЯЁ]')
+
+
+def format_ag_response(raw: str) -> str:
+    """
+    Format an Antigravity agent response for clean Telegram delivery.
+
+    1. Remove system/tool noise tokens.
+    2. Extract "Thought for Xs <Title>" headers → compact italic chain.
+    3. Locate final answer start (first Cyrillic capital).
+    4. Restore numbered-list and priority-label line breaks.
+
+    Safe to call on any string; returns input unchanged when no patterns match.
+    """
+    text = _RE_AG_NOISE.sub(' ', raw)
+    text = re.sub(r'[ \t]{2,}', ' ', text).strip()
+
+    thought_headers: List[str] = []
+    spans: List[Any] = []
+    for m in _RE_AG_THOUGHT.finditer(text):
+        thought_headers.append(m.group(2).strip())
+        spans.append((m.start(), m.end()))
+    for start, end in reversed(spans):
+        text = text[:start] + ' ' + text[end:]
+    text = re.sub(r'[ \t]{2,}', ' ', text).strip()
+
+    cy = _RE_AG_CYRILLIC.search(text)
+    final = text[cy.start():].strip() if cy else text.strip()
+
+    final = _RE_AG_NUMBERED.sub(r'\n\n\1', final)
+    final = _RE_AG_PRIORITY.sub(r'\n\1', final)
+    final = re.sub(r'\n{3,}', '\n\n', final).strip()
+
+    parts: List[str] = []
+    if thought_headers:
+        parts.append(f"_💭 {' → '.join(thought_headers)}_\n")
+    if final:
+        parts.append(final)
+
+    return "\n".join(parts)
+
 
 def _is_word_waterfall(text: str) -> bool:
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -354,8 +449,20 @@ def _is_meaningful(text: str) -> bool:
 
 
 def _stable_hash(text: str) -> str:
-    prefix = text[:200].strip()
-    return hashlib.md5(prefix.encode()).hexdigest()[:8]
+    # FIX: hash full text instead of first 200 chars.
+    # Prefix-only caused false collisions when the thinking block grew beyond
+    # 200 chars: the prefix stayed identical, so the final answer appended at
+    # the end was silently ignored as a duplicate.
+    return hashlib.md5(text.strip().encode()).hexdigest()[:8]
+
+
+def _is_thinking_block(tag: Any) -> bool:
+    """Return True when the DOM element is a thinking/reasoning container."""
+    classes = " ".join(_safe_get_classes(tag))
+    if _THINKING_CLASS_RE.search(classes):
+        return True
+    aria = str(tag.get("aria-label", "")).lower()
+    return "thinking" in aria or "reasoning" in aria
 
 
 def _safe_get_classes(tag: Any) -> List[str]:
@@ -380,6 +487,11 @@ def parse_messages_from_html(html: str) -> List[Dict[str, str]]:
     for tag in soup.find_all(
         class_=re.compile(r"xterm|terminal|cm-editor|cm-content|monaco-editor", re.I)
     ):
+        tag.decompose()
+
+    # FIX: remove thinking containers before parsing to prevent intermediate
+    # reasoning steps being delivered to Telegram as assistant messages.
+    for tag in soup.find_all(lambda t: t.name == "div" and _is_thinking_block(t)):
         tag.decompose()
 
     messages: List[Dict[str, str]] = []

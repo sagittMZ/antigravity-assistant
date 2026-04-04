@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 from app.logger import setup_logger
 from app.state import init_db, get_val, set_val
+from app.phone_worker import format_ag_response
 
 BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -65,6 +66,10 @@ SYSTEMD_SERVICE_NAME = os.getenv("SYSTEMD_SERVICE_NAME", "antigravity-assistant"
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3.0"))
 POLL_TIMEOUT = float(os.getenv("POLL_TIMEOUT", "600"))
+
+# FIX: stable-poll thresholds for collect-and-hold delivery.
+STABLE_AFTER_SEND = int(os.getenv("STABLE_POLLS_AFTER_SEND", "4"))    # 4×3s = 12s silence
+STABLE_BEFORE_SEND = int(os.getenv("STABLE_POLLS_BEFORE_SEND", "20")) # 20×3s = 60s max wait
 BG_WATCH_INTERVAL = float(os.getenv("BG_WATCH_INTERVAL", "10.0"))
 
 bot = Bot(token=BOT_TOKEN)
@@ -83,6 +88,7 @@ _bg_last_hash: Optional[str] = None
 _bg_baseline_hashes: Set[str] = set(get_val("bg_baseline_hashes", []))
 
 _active_chat_id: Optional[int] = None
+_menu_visible: bool = True  # FIX: tracks keyboard visibility for ⊞ toggle
 
 
 def _persist_baseline() -> None:
@@ -324,6 +330,15 @@ async def get_snapshot_hash() -> Optional[str]:
 # Polling
 # ---------------------------------------------------------------------------
 
+async def check_is_generating() -> bool:
+    """Non-blocking check whether Antigravity is mid-generation. Defaults to False on error."""
+    try:
+        data = await pw_get("/is-generating")
+        return bool(data.get("generating", False))
+    except Exception:
+        return False
+
+
 async def poll_for_response(chat_id: int, timeout: Optional[float] = None) -> None:
     global _polling_active, _last_snapshot_hash, _waiting_for_response
     global _bg_last_hash, _bg_baseline_hashes
@@ -331,6 +346,9 @@ async def poll_for_response(chat_id: int, timeout: Optional[float] = None) -> No
     if _polling_active:
         return
 
+    # FIX: collect-and-hold — buffer all streaming updates, deliver only when stable.
+    # Original eager-send caused dozens of partial messages per response.
+    # TRUNCATED guard: skip mid-stream messages that contain "[TRUNCATED]".
     _polling_active = True
     _waiting_for_response = True
     effective_timeout = timeout or POLL_TIMEOUT
@@ -343,8 +361,8 @@ async def poll_for_response(chat_id: int, timeout: Optional[float] = None) -> No
         _mark_sent(m["text"])
 
     prev_hash = _last_snapshot_hash
-    ever_sent = False
     stable_polls = 0
+    pending_msgs: List[Dict[str, str]] = []
 
     try:
         while time.time() - start_time < effective_timeout:
@@ -353,28 +371,40 @@ async def poll_for_response(chat_id: int, timeout: Optional[float] = None) -> No
 
             if current_hash == prev_hash:
                 stable_polls += 1
-                if ever_sent and stable_polls >= 10:
+                if pending_msgs and stable_polls >= STABLE_AFTER_SEND:
+                    if await check_is_generating():
+                        stable_polls = 0
+                        continue
+                    for msg in pending_msgs:
+                        text = msg["text"]
+                        if _is_duplicate(text):
+                            continue
+                        formatted = format_ag_response(text)
+                        await send_long_message(chat_id, f"🤖 {formatted}")
+                        _mark_sent(text)
+                    pending_msgs = []
                     break
-                if not ever_sent and stable_polls >= 50:
+                if not pending_msgs and stable_polls >= STABLE_BEFORE_SEND:
                     break
                 continue
 
             stable_polls = 0
             prev_hash = current_hash
             current_msgs = await get_current_messages()
-            new_msgs = [m for m in current_msgs if m["hash"] not in baseline_hashes]
 
-            for msg in new_msgs:
-                baseline_hashes.add(msg["hash"])
-                if msg["role"] == "user":
-                    _mark_sent(msg["text"])
-                    continue
-                text = msg["text"]
-                if _is_duplicate(text):
-                    continue
-                await send_long_message(chat_id, f"🤖 {text}")
-                _mark_sent(text)
-                ever_sent = True
+            latest_assistant = [
+                m for m in current_msgs
+                if m["hash"] not in baseline_hashes
+                and m["role"] == "assistant"
+                and "[TRUNCATED]" not in m.get("text", "")   # skip partial stream
+            ]
+            if latest_assistant:
+                pending_msgs = latest_assistant
+
+            for m in current_msgs:
+                baseline_hashes.add(m["hash"])
+                if m["role"] == "user":
+                    _mark_sent(m["text"])
 
     finally:
         _polling_active = False
@@ -419,7 +449,10 @@ async def background_watcher() -> None:
                 text = msg["text"]
                 if _is_duplicate(text):
                     continue
-                await send_long_message(_active_chat_id, f"📡 🤖 {text}")
+                if "[TRUNCATED]" in text:
+                    continue
+                formatted = format_ag_response(text)
+                await send_long_message(_active_chat_id, f"📡 🤖 {formatted}")
                 _mark_sent(text)
             _persist_baseline()
     finally:
@@ -435,10 +468,17 @@ def get_main_menu() -> types.ReplyKeyboardMarkup:
     for txt in [
         "Prompt", "Refresh", "Plan", "Task", "Walkthrough",
         "Mode/Model", "New Chat", "Stop", "Projects", "Brain Files",
-        "Status", "Logs",
+        "Status", "Logs", "⊞",
     ]:
         builder.button(text=txt)
     builder.adjust(3)
+    return builder.as_markup(resize_keyboard=True)
+
+
+def get_toggle_button() -> types.ReplyKeyboardMarkup:
+    """Single-row keyboard with only the ⊞ button to re-show the main menu."""
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="⊞")
     return builder.as_markup(resize_keyboard=True)
 
 
@@ -490,8 +530,10 @@ def is_allowed(uid: int) -> bool:
 async def cmd_start(message: types.Message) -> None:
     if not message.from_user or not is_allowed(message.from_user.id):
         return
-    global _active_chat_id
+    global _active_chat_id, _menu_visible
     _active_chat_id = message.chat.id
+    set_val("active_chat_id", message.chat.id)
+    _menu_visible = True
     tg_log.info(f"Bot started by user {message.from_user.id}, chat_id={message.chat.id}")
     await message.answer("Antigravity Assistant active.", reply_markup=get_main_menu())
 
@@ -735,8 +777,25 @@ async def cb_models_refresh(callback: types.CallbackQuery) -> None:
 _MENU_BUTTONS = frozenset([
     "Prompt", "Refresh", "Plan", "Task", "Walkthrough",
     "Mode/Model", "New Chat", "Stop", "Projects", "Brain Files",
-    "Status", "Logs",
+    "Status", "Logs", "⊞",
 ])
+
+
+@dp.message(F.text == "⊞")
+async def btn_toggle_menu(message: types.Message) -> None:
+    """
+    FIX: Toggle the main command keyboard on/off.
+    ⊞ (four-squares icon) hides the full menu and shows only the ⊞ button itself,
+    so the chat area is not cluttered. Tapping ⊞ again restores the full menu.
+    """
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+    global _menu_visible
+    _menu_visible = not _menu_visible
+    if _menu_visible:
+        await message.answer("▼ Меню открыто", reply_markup=get_main_menu())
+    else:
+        await message.answer("▲ Меню скрыто", reply_markup=get_toggle_button())
 
 
 @dp.message(F.text)
@@ -745,6 +804,7 @@ async def handle_prompt(message: types.Message) -> None:
         return
     global _active_chat_id
     _active_chat_id = message.chat.id
+    set_val("active_chat_id", message.chat.id)
 
     text = message.text.strip()
     if text in _MENU_BUTTONS:
@@ -782,9 +842,28 @@ async def _send_or_file(message: types.Message, content: str, filename: str) -> 
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def _auto_init_poller() -> None:
+    """
+    On service restart: restore last chat_id from SQLite, then poll for the
+    Antigravity response to the init-session message sent by launcher.py.
+    Background_watcher cannot deliver it because _active_chat_id is None
+    until the user taps the bot (first run requires one manual /start).
+    """
+    global _active_chat_id
+    await asyncio.sleep(5)
+    saved = get_val("active_chat_id")
+    if not saved:
+        tg_log.info("auto_init_poller: no saved chat_id — skipping (first run?).")
+        return
+    _active_chat_id = int(saved)
+    tg_log.info(f"auto_init_poller: restored chat_id={_active_chat_id}")
+    await poll_for_response(_active_chat_id, timeout=120)
+
+
 async def main() -> None:
     tg_log.info("=== tg_bot starting ===")
     asyncio.create_task(background_watcher())
+    asyncio.create_task(_auto_init_poller())
     await dp.start_polling(bot)
 
 
